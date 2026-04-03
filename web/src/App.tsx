@@ -1,10 +1,11 @@
-// T-10/T-13/T-14/T-19-21: Chat interface with streaming + permission approval for remote-cc web UI
+// T-10/T-13/T-14/T-19-21/T-32-34: Chat interface with streaming, permission approval, reconnect for remote-cc web UI
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { connectWs } from './ws'
+import { connectWs, type WsState, type ReconnectMeta } from './ws'
 import MessageRenderer, { type ChatMessage } from './MessageRenderer'
 import { createStreamingState, streamingToContent, type StreamingMessage } from './streamingState'
 import PermissionDialog, { type PermissionRequest, type PermissionAction } from './PermissionDialog'
+import InstallPrompt from './InstallPrompt'
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
@@ -20,7 +21,14 @@ function getWsUrl(): string {
 }
 
 export default function App() {
-  const [status, setStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected')
+  const [status, setStatus] = useState<WsState>('disconnected')
+  // T-34: Track reconnect attempt for UI display
+  const [reconnectInfo, setReconnectInfo] = useState<ReconnectMeta | null>(null)
+  // T-34: "Reconnected" banner that auto-dismisses after 3s
+  const [showReconnected, setShowReconnected] = useState(false)
+  const reconnectedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const prevStatusRef = useRef<WsState>('disconnected')
+
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [streamingMsg, setStreamingMsg] = useState<StreamingMessage | null>(null)
   const [input, setInput] = useState('')
@@ -57,7 +65,27 @@ export default function App() {
     wsRef.current = ws
     const ss = streamStateRef.current
 
-    ws.onStateChange(setStatus)
+    // T-34: Handle state changes with reconnect metadata
+    ws.onStateChange((state: WsState, meta?: ReconnectMeta) => {
+      const prev = prevStatusRef.current
+      prevStatusRef.current = state
+
+      setStatus(state)
+      setReconnectInfo(state === 'reconnecting' && meta ? meta : null)
+
+      // T-34: Show "Reconnected" banner when transitioning from reconnecting to connected
+      if (state === 'connected' && (prev === 'reconnecting' || prev === 'connecting')) {
+        // Only show if we were actually reconnecting (not initial connect)
+        if (prev === 'reconnecting') {
+          setShowReconnected(true)
+          if (reconnectedTimerRef.current) clearTimeout(reconnectedTimerRef.current)
+          reconnectedTimerRef.current = setTimeout(() => {
+            setShowReconnected(false)
+            reconnectedTimerRef.current = null
+          }, 3000)
+        }
+      }
+    })
 
     ws.onMessage((data) => {
       if (!data || typeof data !== 'object' || !('type' in (data as Record<string, unknown>))) return
@@ -144,6 +172,11 @@ export default function App() {
         cancelAnimationFrame(rafIdRef.current)
         rafIdRef.current = null
       }
+      // Clean up reconnected banner timer
+      if (reconnectedTimerRef.current) {
+        clearTimeout(reconnectedTimerRef.current)
+        reconnectedTimerRef.current = null
+      }
     }
   }, [scheduleRender])
 
@@ -216,11 +249,15 @@ export default function App() {
       }
     : null
 
+  // T-34: Connection status indicator colors and labels
   const statusColor = status === 'connected' ? 'bg-green-400'
+    : status === 'reconnecting' ? 'bg-yellow-400 animate-pulse'
     : status === 'connecting' ? 'bg-yellow-400 animate-pulse'
     : 'bg-red-400'
 
   const statusLabel = status === 'connected' ? 'Connected'
+    : status === 'reconnecting' && reconnectInfo
+      ? `Reconnecting (${reconnectInfo.attempt}/${reconnectInfo.maxAttempts})`
     : status === 'connecting' ? 'Connecting...'
     : 'Disconnected'
 
@@ -278,6 +315,9 @@ export default function App() {
         const first = pendingPerms.values().next().value as PermissionRequest
         return <PermissionDialog request={first} onRespond={handlePermission} />
       })()}
+
+      {/* T-28: PWA install prompt */}
+      <InstallPrompt />
     </div>
   )
 }
