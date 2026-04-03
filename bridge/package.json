@@ -1,0 +1,31 @@
+{
+  "name": "remote-cc",
+  "version": "0.1.0",
+  "description": "Remote control for Claude Code from your phone",
+  "type": "module",
+  "bin": {
+    "remote-cc": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "test": "vitest",
+    "start": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.0.0",
+    "qrcode": "^1.0.0",
+    "chalk": "^5.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "tsx": "^4.0.0",
+    "vitest": "^3.0.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.0.0"
+  }
+}
