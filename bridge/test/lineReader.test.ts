@@ -172,6 +172,84 @@ describe('createLineReader', () => {
     const lines = await collectLines(stream)
     expect(lines).toEqual(['no newlines here'])
   })
+
+  it('should handle UTF-8 multi-byte chars split across chunk boundaries', async () => {
+    const stream = new PassThrough()
+
+    // Chinese character "你" is 3 bytes: 0xe4 0xbd 0xa0
+    // "好" is 3 bytes: 0xe5 0xa5 0xbd
+    // Split "你好\n" across chunks so the multi-byte char spans the boundary
+    const fullBytes = Buffer.from('你好\n', 'utf8')
+    // Split after byte 1 of "你" (mid-character)
+    const chunk1 = fullBytes.subarray(0, 1)  // 0xe4 (incomplete char)
+    const chunk2 = fullBytes.subarray(1)      // rest: 0xbd 0xa0 + "好\n"
+
+    stream.push(chunk1)
+    stream.push(chunk2)
+    stream.push(null)
+
+    const lines = await collectLines(stream)
+    expect(lines).toEqual(['你好'])
+  })
+
+  it('should handle emoji (4-byte UTF-8) split across chunk boundaries', async () => {
+    const stream = new PassThrough()
+
+    // Emoji "🎉" is 4 bytes: 0xf0 0x9f 0x8e 0x89
+    const fullBytes = Buffer.from('hello 🎉 world\n', 'utf8')
+    // Find the emoji start and split in the middle of it
+    const emojiStart = fullBytes.indexOf(0xf0)
+    const chunk1 = fullBytes.subarray(0, emojiStart + 2)  // split inside emoji
+    const chunk2 = fullBytes.subarray(emojiStart + 2)
+
+    stream.push(chunk1)
+    stream.push(chunk2)
+    stream.push(null)
+
+    const lines = await collectLines(stream)
+    expect(lines).toEqual(['hello 🎉 world'])
+  })
+
+  it('should handle multiple multi-byte chars across multiple chunk boundaries', async () => {
+    const stream = new PassThrough()
+
+    // Build a line with various multi-byte chars
+    const text = '日本語テスト\n'
+    const fullBytes = Buffer.from(text, 'utf8')
+
+    // Split into single-byte chunks to maximally stress the decoder
+    for (let i = 0; i < fullBytes.length; i++) {
+      stream.push(fullBytes.subarray(i, i + 1))
+    }
+    stream.push(null)
+
+    const lines = await collectLines(stream)
+    expect(lines).toEqual(['日本語テスト'])
+  })
+
+  it('should clean up listeners when generator is returned early', async () => {
+    const stream = new PassThrough()
+
+    const reader = createLineReader(stream)
+    const iter = reader[Symbol.asyncIterator]()
+
+    stream.push('line1\nline2\nline3\n')
+    await new Promise(r => setTimeout(r, 10))
+
+    // Read only first line then return (close the iterator)
+    const first = await iter.next()
+    expect(first.value).toBe('line1')
+
+    // Close the generator — should remove listeners
+    await iter.return!(undefined)
+
+    // Verify listeners were removed (data, end, error)
+    expect(stream.listenerCount('data')).toBe(0)
+    expect(stream.listenerCount('end')).toBe(0)
+    expect(stream.listenerCount('error')).toBe(0)
+
+    stream.destroy()
+  })
 })
 
 describe('writeLine', () => {

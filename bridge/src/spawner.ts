@@ -164,10 +164,21 @@ export function spawnClaude(cwd: string, opts?: SpawnClaudeOptions): ClaudeProce
     )
   }
 
-  // Forward SIGTERM/SIGINT from bridge to child
+  // Track whether we received a termination signal so we know to exit
+  // after the child dies (otherwise the signal handlers suppress default
+  // Node.js termination behavior and the bridge hangs).
+  let receivedSignal: NodeJS.Signals | null = null
+
   const forwardSignal = (signal: NodeJS.Signals) => {
+    receivedSignal = signal
     if (child && !child.killed) {
       child.kill(signal)
+      // If child doesn't exit within 5s, escalate to SIGKILL
+      setTimeout(() => {
+        if (!child.killed) {
+          child.kill('SIGKILL')
+        }
+      }, 5000).unref()
     }
   }
 
@@ -178,10 +189,18 @@ export function spawnClaude(cwd: string, opts?: SpawnClaudeOptions): ClaudeProce
   process.on('SIGINT', onSigint)
 
   // Clean up signal listeners when child exits (via onExit callback,
-  // which fires from whichever of 'close' or 'error' comes first)
+  // which fires from whichever of 'close' or 'error' comes first).
+  // If we received a signal, re-raise it so the bridge exits with the
+  // correct signal-based exit code.
   const cleanupSignals = () => {
     process.removeListener('SIGTERM', onSigterm)
     process.removeListener('SIGINT', onSigint)
+
+    if (receivedSignal) {
+      // Re-raise the signal with default handler to terminate the bridge.
+      // Reset to default handler first, then re-send.
+      process.kill(process.pid, receivedSignal)
+    }
   }
 
   return new ClaudeProcessImpl(child, cleanupSignals)

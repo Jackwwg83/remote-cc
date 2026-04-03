@@ -19,8 +19,8 @@
 export interface InitializeResult {
   /** The request_id from the initialize control_request. */
   requestId: string
-  /** Any messages that arrived before the initialize request. */
-  preInitMessages: unknown[]
+  /** Any raw JSON lines that arrived before the initialize request. */
+  preInitMessages: string[]
 }
 
 export class InitializeTimeoutError extends Error {
@@ -43,25 +43,23 @@ export const INITIALIZE_TIMEOUT_MS = 10_000
 /**
  * Wait for claude's initialize handshake and reply.
  *
- * Reads lines from the provided async iterable, looking for the first
- * `control_request` with `subtype: 'initialize'`. All messages received
- * before the initialize request are collected and returned (not dropped).
+ * Uses the iterator's `.next()` method directly (instead of `for-await`)
+ * so the async generator from `createLineReader` is NOT closed on return.
+ * This allows the caller to continue reading post-init messages from the
+ * same iterator.
  *
- * When the initialize request is found, a `control_response` is written
- * to claude's stdin via the provided `writeToStdin` callback.
- *
- * @param lines - Async iterable of raw JSON lines from claude stdout
+ * @param iterator - An AsyncIterator of raw JSON lines (created from createLineReader)
  * @param writeToStdin - Callback to write a JSON object to claude stdin
  * @param timeoutMs - Timeout in ms (default: 10000)
- * @returns The request_id and any pre-init messages
+ * @returns The request_id and any pre-init messages (raw JSON strings)
  * @throws InitializeTimeoutError if no initialize request within timeout
  */
 export async function waitForInitialize(
-  lines: AsyncIterable<string>,
+  iterator: AsyncIterator<string>,
   writeToStdin: (obj: unknown) => void,
   timeoutMs: number = INITIALIZE_TIMEOUT_MS,
 ): Promise<InitializeResult> {
-  const preInitMessages: unknown[] = []
+  const preInitMessages: string[] = []
 
   // Race the line iteration against a timeout
   return new Promise<InitializeResult>((resolve, reject) => {
@@ -76,8 +74,22 @@ export async function waitForInitialize(
 
     const iterate = async () => {
       try {
-        for await (const line of lines) {
+        for (;;) {
+          const result = await iterator.next()
+
+          if (result.done) {
+            // Stream ended without initialize
+            if (!settled) {
+              settled = true
+              clearTimeout(timer)
+              reject(new Error('Stream ended before initialize request was received'))
+            }
+            return
+          }
+
           if (settled) return
+
+          const line = result.value
 
           // Skip empty lines
           if (!line.trim()) continue
@@ -125,15 +137,8 @@ export async function waitForInitialize(
             return
           }
 
-          // Not the initialize request — collect as pre-init message
-          preInitMessages.push(msg)
-        }
-
-        // Stream ended without initialize
-        if (!settled) {
-          settled = true
-          clearTimeout(timer)
-          reject(new Error('Stream ended before initialize request was received'))
+          // Not the initialize request — collect as pre-init message (raw JSON string)
+          preInitMessages.push(line)
         }
       } catch (err) {
         if (!settled) {

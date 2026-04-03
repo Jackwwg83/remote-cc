@@ -11,6 +11,7 @@
  */
 
 import type { Readable, Writable } from 'node:stream'
+import { StringDecoder } from 'node:string_decoder'
 
 // ---------------------------------------------------------------------------
 // createLineReader — async iterable that yields complete lines from a stream
@@ -28,6 +29,7 @@ import type { Readable, Writable } from 'node:stream'
  */
 export async function* createLineReader(stream: Readable): AsyncIterable<string> {
   let buffer = ''
+  const decoder = new StringDecoder('utf8')
 
   // We need to bridge Node's event-based stream API into an async iterator.
   // Use a queue of resolved/pending promises to do so.
@@ -48,8 +50,8 @@ export async function* createLineReader(stream: Readable): AsyncIterable<string>
     }
   }
 
-  stream.on('data', (chunk: Buffer | string) => {
-    buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf-8')
+  const onData = (chunk: Buffer | string) => {
+    buffer += typeof chunk === 'string' ? chunk : decoder.write(chunk)
     flush()
     // Wake up the consumer if it's waiting
     if (notify) {
@@ -57,9 +59,11 @@ export async function* createLineReader(stream: Readable): AsyncIterable<string>
       notify = null
       n()
     }
-  })
+  }
 
-  stream.on('end', () => {
+  const onEnd = () => {
+    // Flush any remaining bytes held by the decoder
+    buffer += decoder.end()
     // Yield any remaining buffer content as the last line
     if (buffer.length > 0) {
       queue.push(buffer)
@@ -71,9 +75,9 @@ export async function* createLineReader(stream: Readable): AsyncIterable<string>
       notify = null
       n()
     }
-  })
+  }
 
-  stream.on('error', (err: Error) => {
+  const onError = (err: Error) => {
     error = err
     done = true
     if (notify) {
@@ -81,28 +85,40 @@ export async function* createLineReader(stream: Readable): AsyncIterable<string>
       notify = null
       n()
     }
-  })
+  }
+
+  stream.on('data', onData)
+  stream.on('end', onEnd)
+  stream.on('error', onError)
 
   // Yield lines as they become available
-  for (;;) {
-    // Drain the queue first
-    while (queue.length > 0) {
-      yield queue.shift()!
-    }
-
-    // If stream is done and queue is empty, we're finished
-    if (done) {
-      // Check for error
-      if (error) {
-        throw error
+  try {
+    for (;;) {
+      // Drain the queue first
+      while (queue.length > 0) {
+        yield queue.shift()!
       }
-      return
-    }
 
-    // Wait for more data
-    await new Promise<void>((resolve) => {
-      notify = resolve
-    })
+      // If stream is done and queue is empty, we're finished
+      if (done) {
+        // Check for error
+        if (error) {
+          throw error
+        }
+        return
+      }
+
+      // Wait for more data
+      await new Promise<void>((resolve) => {
+        notify = resolve
+      })
+    }
+  } finally {
+    // Clean up listeners when the generator is closed (return/throw) or
+    // when the consumer stops iterating (for-await break/return).
+    stream.removeListener('data', onData)
+    stream.removeListener('end', onEnd)
+    stream.removeListener('error', onError)
   }
 }
 

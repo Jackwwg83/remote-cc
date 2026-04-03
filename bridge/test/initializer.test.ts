@@ -21,11 +21,12 @@ import {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Create a PassThrough stream and an async iterable of lines from it. */
+/** Create a PassThrough stream and an async iterator of lines from it. */
 function createTestStream() {
   const stream = new PassThrough()
-  const lines = createLineReader(stream)
-  return { stream, lines }
+  const reader = createLineReader(stream)
+  const iterator = reader[Symbol.asyncIterator]()
+  return { stream, iterator }
 }
 
 /** Push a JSON message as a line to the stream. */
@@ -54,7 +55,7 @@ describe('waitForInitialize', () => {
   })
 
   it('should complete handshake on a normal initialize request', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writtenMessages: unknown[] = []
     const writeToStdin = (obj: unknown) => writtenMessages.push(obj)
 
@@ -62,7 +63,7 @@ describe('waitForInitialize', () => {
     pushMessage(stream, makeInitRequest('req_abc'))
     stream.push(null)
 
-    const result = await waitForInitialize(lines, writeToStdin)
+    const result = await waitForInitialize(iterator, writeToStdin)
 
     // Verify result
     expect(result.requestId).toBe('req_abc')
@@ -88,7 +89,7 @@ describe('waitForInitialize', () => {
   })
 
   it('should echo back the correct request_id', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writtenMessages: unknown[] = []
     const writeToStdin = (obj: unknown) => writtenMessages.push(obj)
 
@@ -96,7 +97,7 @@ describe('waitForInitialize', () => {
     pushMessage(stream, makeInitRequest(customId))
     stream.push(null)
 
-    const result = await waitForInitialize(lines, writeToStdin)
+    const result = await waitForInitialize(iterator, writeToStdin)
 
     expect(result.requestId).toBe(customId)
     const response = writtenMessages[0] as Record<string, unknown>
@@ -105,7 +106,7 @@ describe('waitForInitialize', () => {
   })
 
   it('should collect pre-init messages without dropping them', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writtenMessages: unknown[] = []
     const writeToStdin = (obj: unknown) => writtenMessages.push(obj)
 
@@ -120,27 +121,27 @@ describe('waitForInitialize', () => {
     pushMessage(stream, makeInitRequest('req_init_after_status'))
     stream.push(null)
 
-    const result = await waitForInitialize(lines, writeToStdin)
+    const result = await waitForInitialize(iterator, writeToStdin)
 
     expect(result.requestId).toBe('req_init_after_status')
     expect(result.preInitMessages).toHaveLength(3)
-    expect(result.preInitMessages[0]).toEqual(statusMsg1)
-    expect(result.preInitMessages[1]).toEqual(statusMsg2)
-    expect(result.preInitMessages[2]).toEqual(authMsg)
+    expect(JSON.parse(result.preInitMessages[0])).toEqual(statusMsg1)
+    expect(JSON.parse(result.preInitMessages[1])).toEqual(statusMsg2)
+    expect(JSON.parse(result.preInitMessages[2])).toEqual(authMsg)
 
     // Only one response written (the initialize response)
     expect(writtenMessages).toHaveLength(1)
   })
 
   it('should time out if no initialize request arrives', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writeToStdin = vi.fn()
 
     // Push non-initialize messages only, don't end the stream
     pushMessage(stream, { type: 'status', status: 'loading' })
 
     await expect(
-      waitForInitialize(lines, writeToStdin, 100), // short timeout for test
+      waitForInitialize(iterator, writeToStdin, 100), // short timeout for test
     ).rejects.toThrow(InitializeTimeoutError)
 
     // No response should have been written
@@ -151,7 +152,7 @@ describe('waitForInitialize', () => {
   })
 
   it('should reject if stream ends before initialize request', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writeToStdin = vi.fn()
 
     // End the stream without sending initialize
@@ -159,14 +160,14 @@ describe('waitForInitialize', () => {
     stream.push(null)
 
     await expect(
-      waitForInitialize(lines, writeToStdin, 5000),
+      waitForInitialize(iterator, writeToStdin, 5000),
     ).rejects.toThrow('Stream ended before initialize request was received')
 
     expect(writeToStdin).not.toHaveBeenCalled()
   })
 
   it('should skip malformed JSON lines gracefully', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writtenMessages: unknown[] = []
     const writeToStdin = (obj: unknown) => writtenMessages.push(obj)
 
@@ -176,7 +177,7 @@ describe('waitForInitialize', () => {
     pushMessage(stream, makeInitRequest('req_after_garbage'))
     stream.push(null)
 
-    const result = await waitForInitialize(lines, writeToStdin)
+    const result = await waitForInitialize(iterator, writeToStdin)
 
     expect(result.requestId).toBe('req_after_garbage')
     // Malformed lines are skipped, not collected as pre-init messages
@@ -185,7 +186,7 @@ describe('waitForInitialize', () => {
   })
 
   it('should skip empty lines', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writtenMessages: unknown[] = []
     const writeToStdin = (obj: unknown) => writtenMessages.push(obj)
 
@@ -194,14 +195,14 @@ describe('waitForInitialize', () => {
     pushMessage(stream, makeInitRequest('req_after_empty'))
     stream.push(null)
 
-    const result = await waitForInitialize(lines, writeToStdin)
+    const result = await waitForInitialize(iterator, writeToStdin)
 
     expect(result.requestId).toBe('req_after_empty')
     expect(result.preInitMessages).toEqual([])
   })
 
   it('should ignore control_requests with non-initialize subtypes', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writtenMessages: unknown[] = []
     const writeToStdin = (obj: unknown) => writtenMessages.push(obj)
 
@@ -215,23 +216,23 @@ describe('waitForInitialize', () => {
     pushMessage(stream, makeInitRequest('req_real_init'))
     stream.push(null)
 
-    const result = await waitForInitialize(lines, writeToStdin)
+    const result = await waitForInitialize(iterator, writeToStdin)
 
     expect(result.requestId).toBe('req_real_init')
-    // The interrupt request should be in pre-init messages
+    // The interrupt request should be in pre-init messages (as raw JSON string)
     expect(result.preInitMessages).toHaveLength(1)
-    expect(result.preInitMessages[0]).toEqual(interruptReq)
+    expect(JSON.parse(result.preInitMessages[0])).toEqual(interruptReq)
   })
 
   it('should include process.pid in the response', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writtenMessages: unknown[] = []
     const writeToStdin = (obj: unknown) => writtenMessages.push(obj)
 
     pushMessage(stream, makeInitRequest('req_pid_check'))
     stream.push(null)
 
-    await waitForInitialize(lines, writeToStdin)
+    await waitForInitialize(iterator, writeToStdin)
 
     const response = writtenMessages[0] as Record<string, unknown>
     const inner = response.response as Record<string, unknown>
@@ -244,12 +245,12 @@ describe('waitForInitialize', () => {
   })
 
   it('should handle delayed initialize arriving before timeout', async () => {
-    const { stream, lines } = createTestStream()
+    const { stream, iterator } = createTestStream()
     const writtenMessages: unknown[] = []
     const writeToStdin = (obj: unknown) => writtenMessages.push(obj)
 
     // Start waiting, then push init after a small delay
-    const promise = waitForInitialize(lines, writeToStdin, 2000)
+    const promise = waitForInitialize(iterator, writeToStdin, 2000)
 
     // Status first
     pushMessage(stream, { type: 'system', message: 'loading' })
@@ -264,5 +265,39 @@ describe('waitForInitialize', () => {
     expect(result.requestId).toBe('req_delayed')
     expect(result.preInitMessages).toHaveLength(1)
     expect(writtenMessages).toHaveLength(1)
+  })
+
+  it('should allow reading post-init messages from the same iterator', async () => {
+    // This is the critical test: after waitForInitialize returns, the
+    // iterator must NOT be closed — callers continue reading normal messages.
+    const { stream, iterator } = createTestStream()
+    const writtenMessages: unknown[] = []
+    const writeToStdin = (obj: unknown) => writtenMessages.push(obj)
+
+    // Push init, then post-init messages
+    pushMessage(stream, makeInitRequest('req_post'))
+
+    const result = await waitForInitialize(iterator, writeToStdin)
+    expect(result.requestId).toBe('req_post')
+
+    // Now push messages AFTER init completes — the iterator must still work
+    const postMsg1 = { type: 'assistant', message: { content: 'hello' } }
+    const postMsg2 = { type: 'result', result: 42 }
+    pushMessage(stream, postMsg1)
+    pushMessage(stream, postMsg2)
+
+    // Read them from the same iterator
+    const next1 = await iterator.next()
+    expect(next1.done).toBe(false)
+    expect(JSON.parse(next1.value!)).toEqual(postMsg1)
+
+    const next2 = await iterator.next()
+    expect(next2.done).toBe(false)
+    expect(JSON.parse(next2.value!)).toEqual(postMsg2)
+
+    // End the stream and verify iterator finishes
+    stream.push(null)
+    const next3 = await iterator.next()
+    expect(next3.done).toBe(true)
   })
 })
