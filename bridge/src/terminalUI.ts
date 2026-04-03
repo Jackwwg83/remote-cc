@@ -13,22 +13,47 @@ const VERSION = '0.1.0'
 // Local IP detection
 // ---------------------------------------------------------------------------
 
-/** Return the first non-internal IPv4 address, or null. */
-function detectLocalIP(): string | null {
+/** Detected network addresses, separated by type. */
+export interface NetworkAddresses {
+  tailscale: string | null
+  lan: string | null
+}
+
+/**
+ * Detect non-internal IPv4 addresses, preferring Tailscale.
+ *
+ * Tailscale interfaces are identified by:
+ * - Interface name: `tailscale0` (Linux), `utun*` (macOS)
+ * - Address in the Tailscale CGNAT range: 100.64.0.0/10
+ *
+ * TODO: tests for IPv6/multi-interface scenarios (complex to mock os.networkInterfaces)
+ */
+export function detectNetworkAddresses(): NetworkAddresses {
+  const result: NetworkAddresses = { tailscale: null, lan: null }
   try {
     const nets = networkInterfaces()
-    for (const ifaces of Object.values(nets)) {
+    for (const [name, ifaces] of Object.entries(nets)) {
       if (!ifaces) continue
       for (const iface of ifaces) {
-        if (iface.family === 'IPv4' && !iface.internal) {
-          return iface.address
+        if (iface.family !== 'IPv4' || iface.internal) continue
+
+        const isTailscaleIface = name === 'tailscale0' || name.startsWith('utun')
+        const isTailscaleAddr = iface.address.startsWith('100.')
+        // Tailscale CGNAT range: 100.64.0.0 – 100.127.255.255
+        const octet2 = parseInt(iface.address.split('.')[1], 10)
+        const inCGNAT = isTailscaleAddr && octet2 >= 64 && octet2 <= 127
+
+        if ((isTailscaleIface && isTailscaleAddr) || inCGNAT) {
+          if (!result.tailscale) result.tailscale = iface.address
+        } else {
+          if (!result.lan) result.lan = iface.address
         }
       }
     }
   } catch {
-    // Silently ignore — we'll just skip the Network line
+    // Silently ignore — we'll just skip the network lines
   }
-  return null
+  return result
 }
 
 // ---------------------------------------------------------------------------
@@ -41,22 +66,28 @@ function detectLocalIP(): string | null {
  * ```
  * remote-cc v0.1.0
  *
- *    Local:     http://localhost:7860
- *    Network:   http://192.168.1.5:7860
+ *    Local:      http://localhost:7860
+ *    Tailscale:  http://100.64.1.5:7860
+ *    LAN:        http://192.168.1.5:7860
  *
  *    Waiting for client connection...
  * ```
  */
 export function printStartupBanner(url: string, port: number): void {
-  const localIP = detectLocalIP()
+  const addrs = detectNetworkAddresses()
 
   console.log()
   console.log(chalk.bold.cyan(`  remote-cc`) + chalk.dim(` v${VERSION}`))
   console.log()
-  console.log(`   ${chalk.dim('Local:')}     ${chalk.green(url)}`)
-  if (localIP) {
+  console.log(`   ${chalk.dim('Local:')}      ${chalk.green(`http://localhost:${port}`)}`)
+  if (addrs.tailscale) {
     console.log(
-      `   ${chalk.dim('Network:')}   ${chalk.green(`http://${localIP}:${port}`)}`,
+      `   ${chalk.dim('Tailscale:')}  ${chalk.green(`http://${addrs.tailscale}:${port}`)}`,
+    )
+  }
+  if (addrs.lan) {
+    console.log(
+      `   ${chalk.dim('LAN:')}        ${chalk.green(`http://${addrs.lan}:${port}`)}`,
     )
   }
   console.log()

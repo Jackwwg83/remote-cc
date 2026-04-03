@@ -21,7 +21,7 @@ const VERSION = '0.1.0'
 
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 }
 
@@ -91,6 +91,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
   }
 
   // Route: GET /sessions
+  // TODO: integrate with wsServer state to return real session list (T-12 wiring)
   if (method === 'GET' && url === '/sessions') {
     sendJson(res, 200, [])
     return
@@ -121,10 +122,15 @@ export function startHttpServer(port: number): Promise<{ server: HttpServer; url
 
     server.listen(port, '0.0.0.0', () => {
       const addr = server.address()
-      const resolvedPort = typeof addr === 'object' && addr !== null ? addr.port : port
+      let resolvedHost = '0.0.0.0'
+      let resolvedPort = port
+      if (typeof addr === 'object' && addr !== null) {
+        resolvedHost = addr.address
+        resolvedPort = addr.port
+      }
       resolve({
         server,
-        url: `http://localhost:${resolvedPort}`,
+        url: `http://${resolvedHost}:${resolvedPort}`,
       })
     })
   })

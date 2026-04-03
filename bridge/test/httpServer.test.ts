@@ -27,6 +27,8 @@ function tick(ms = 50): Promise<void> {
 describe('startHttpServer', () => {
   let server: HttpServer | undefined
   let baseUrl: string
+  /** localhost-based URL for fetch calls (0.0.0.0 may not resolve on all platforms). */
+  let fetchUrl: string
 
   afterEach(async () => {
     if (server) {
@@ -42,15 +44,18 @@ describe('startHttpServer', () => {
     const result = await startHttpServer(0)
     server = result.server
     baseUrl = result.url
+    // Extract port from the 0.0.0.0 URL so we can fetch via localhost
+    const port = new URL(baseUrl).port
+    fetchUrl = `http://localhost:${port}`
   }
 
   // -------------------------------------------------------------------------
   // Server startup
   // -------------------------------------------------------------------------
 
-  it('should start and return a url', async () => {
+  it('should start and return a url with the actual bind address', async () => {
     await startTest()
-    expect(baseUrl).toMatch(/^http:\/\/localhost:\d+$/)
+    expect(baseUrl).toMatch(/^http:\/\/0\.0\.0\.0:\d+$/)
   })
 
   // -------------------------------------------------------------------------
@@ -60,7 +65,7 @@ describe('startHttpServer', () => {
   it('should return placeholder HTML on GET /', async () => {
     await startTest()
 
-    const res = await fetch(`${baseUrl}/`)
+    const res = await fetch(`${fetchUrl}/`)
     expect(res.status).toBe(200)
     expect(res.headers.get('content-type')).toContain('text/html')
 
@@ -76,7 +81,7 @@ describe('startHttpServer', () => {
   it('should return health JSON on GET /health', async () => {
     await startTest()
 
-    const res = await fetch(`${baseUrl}/health`)
+    const res = await fetch(`${fetchUrl}/health`)
     expect(res.status).toBe(200)
     expect(res.headers.get('content-type')).toContain('application/json')
 
@@ -91,7 +96,7 @@ describe('startHttpServer', () => {
   it('should return empty array on GET /sessions', async () => {
     await startTest()
 
-    const res = await fetch(`${baseUrl}/sessions`)
+    const res = await fetch(`${fetchUrl}/sessions`)
     expect(res.status).toBe(200)
     expect(res.headers.get('content-type')).toContain('application/json')
 
@@ -106,7 +111,7 @@ describe('startHttpServer', () => {
   it('should return 404 for unknown routes', async () => {
     await startTest()
 
-    const res = await fetch(`${baseUrl}/nonexistent`)
+    const res = await fetch(`${fetchUrl}/nonexistent`)
     expect(res.status).toBe(404)
     expect(res.headers.get('content-type')).toContain('application/json')
 
@@ -117,7 +122,7 @@ describe('startHttpServer', () => {
   it('should return 404 for POST to known GET routes', async () => {
     await startTest()
 
-    const res = await fetch(`${baseUrl}/health`, { method: 'POST' })
+    const res = await fetch(`${fetchUrl}/health`, { method: 'POST' })
     expect(res.status).toBe(404)
   })
 
@@ -129,22 +134,24 @@ describe('startHttpServer', () => {
     await startTest()
 
     // Check on a 200 response
-    const res200 = await fetch(`${baseUrl}/health`)
+    const res200 = await fetch(`${fetchUrl}/health`)
     expect(res200.headers.get('access-control-allow-origin')).toBe('*')
     expect(res200.headers.get('access-control-allow-methods')).toContain('GET')
+    expect(res200.headers.get('access-control-allow-methods')).not.toContain('POST')
 
     // Check on a 404 response
-    const res404 = await fetch(`${baseUrl}/nonexistent`)
+    const res404 = await fetch(`${fetchUrl}/nonexistent`)
     expect(res404.headers.get('access-control-allow-origin')).toBe('*')
   })
 
   it('should handle OPTIONS preflight with 204', async () => {
     await startTest()
 
-    const res = await fetch(`${baseUrl}/health`, { method: 'OPTIONS' })
+    const res = await fetch(`${fetchUrl}/health`, { method: 'OPTIONS' })
     expect(res.status).toBe(204)
     expect(res.headers.get('access-control-allow-origin')).toBe('*')
     expect(res.headers.get('access-control-allow-methods')).toContain('GET')
+    expect(res.headers.get('access-control-allow-methods')).not.toContain('POST')
     expect(res.headers.get('access-control-allow-headers')).toContain('Content-Type')
   })
 
@@ -155,7 +162,7 @@ describe('startHttpServer', () => {
   it('should return valid HTML on GET /', async () => {
     await startTest()
 
-    const res = await fetch(`${baseUrl}/`)
+    const res = await fetch(`${fetchUrl}/`)
     const body = await res.text()
     expect(body).toContain('<!DOCTYPE html>')
     expect(body).toContain('<html')
