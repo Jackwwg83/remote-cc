@@ -15,6 +15,13 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { Server as HttpServer } from 'node:http'
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Max bufferedAmount (bytes) before a client is skipped during broadcast. */
+const BACKPRESSURE_THRESHOLD = 1_048_576 // 1 MB
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -79,9 +86,14 @@ export function createWsServer(httpServer: HttpServer): WsServer {
   return {
     broadcast(data: string): void {
       for (const ws of clients) {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(data)
+        if (ws.readyState !== WebSocket.OPEN) continue
+        if (ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
+          console.warn(
+            `[wsServer] skipping client (bufferedAmount ${ws.bufferedAmount} > ${BACKPRESSURE_THRESHOLD})`,
+          )
+          continue
         }
+        ws.send(data)
       }
     },
 
@@ -94,13 +106,15 @@ export function createWsServer(httpServer: HttpServer): WsServer {
     },
 
     close(): void {
-      // Close all client connections
+      // Stop accepting new connections first
+      wss.close()
+      // Clear all message callbacks — no more forwarding after close
+      messageCallbacks.length = 0
+      // Initiate graceful close on each client.
+      // Actual removal from `clients` happens in the per-socket 'close' handler.
       for (const ws of clients) {
         ws.close()
       }
-      clients.clear()
-      // Shut down the server
-      wss.close()
     },
   }
 }
