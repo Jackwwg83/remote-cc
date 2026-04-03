@@ -2,7 +2,8 @@
  * httpServer.ts — HTTP server for the bridge.
  *
  * This is the entry point for the bridge:
- * - Serves a placeholder HTML page at GET / (replaced later by web UI)
+ * - Serves the web UI from ../web/dist/ (Vite build output) as static files
+ * - Falls back to a placeholder if the dist directory doesn't exist
  * - Exposes health check at GET /health
  * - Exposes session list at GET /sessions
  * - Returns 404 for unknown routes
@@ -12,6 +13,9 @@
  */
 
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { existsSync, readFileSync } from 'node:fs'
+import { join, extname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -19,10 +23,32 @@ import { createServer, type Server as HttpServer, type IncomingMessage, type Ser
 
 const VERSION = '0.1.0'
 
+// Resolve the web dist directory relative to this file's location.
+// In dev (tsx): src/httpServer.ts → ../../web/dist
+// In prod (compiled): dist/httpServer.js → ../../web/dist
+const __dirname = fileURLToPath(new URL('.', import.meta.url))
+const WEB_DIST_DIR = join(__dirname, '..', '..', 'web', 'dist')
+const WEB_DIST_EXISTS = existsSync(WEB_DIST_DIR)
+
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
+}
+
+const MIME_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js':   'application/javascript; charset=utf-8',
+  '.css':  'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg':  'image/svg+xml',
+  '.ico':  'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf':  'font/ttf',
 }
 
 const PLACEHOLDER_HTML = `<!DOCTYPE html>
@@ -34,7 +60,8 @@ const PLACEHOLDER_HTML = `<!DOCTYPE html>
 </head>
 <body>
   <h1>remote-cc</h1>
-  <p>Web UI coming soon.</p>
+  <p>Web UI not built yet. Run <code>cd web && npm run build</code> first,</p>
+  <p>or use the Vite dev server: <code>cd web && npm run dev</code></p>
 </body>
 </html>`
 
@@ -61,6 +88,40 @@ function sendHtml(res: ServerResponse, statusCode: number, html: string): void {
   res.end(html)
 }
 
+/**
+ * Try to serve a static file from the web dist directory.
+ * Returns true if the file was served, false otherwise.
+ */
+function tryServeStatic(urlPath: string, res: ServerResponse): boolean {
+  if (!WEB_DIST_EXISTS) return false
+
+  // Normalize: "/" → "/index.html"
+  let filePath = urlPath === '/' ? '/index.html' : urlPath
+
+  // Security: prevent directory traversal
+  if (filePath.includes('..')) return false
+
+  const fullPath = join(WEB_DIST_DIR, filePath)
+
+  // Check file exists
+  if (!existsSync(fullPath)) return false
+
+  const ext = extname(fullPath)
+  const contentType = MIME_TYPES[ext] ?? 'application/octet-stream'
+
+  try {
+    const content = readFileSync(fullPath)
+    for (const [key, value] of Object.entries(CORS_HEADERS)) {
+      res.setHeader(key, value)
+    }
+    res.writeHead(200, { 'Content-Type': contentType })
+    res.end(content)
+    return true
+  } catch {
+    return false
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Request handler
 // ---------------------------------------------------------------------------
@@ -78,11 +139,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
     return
   }
 
-  // Route: GET /
-  if (method === 'GET' && url === '/') {
-    sendHtml(res, 200, PLACEHOLDER_HTML)
-    return
-  }
+  // API routes first (before static file serving)
 
   // Route: GET /health
   if (method === 'GET' && url === '/health') {
@@ -91,10 +148,30 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
   }
 
   // Route: GET /sessions
-  // TODO: integrate with wsServer state to return real session list (T-12 wiring)
   if (method === 'GET' && url === '/sessions') {
     sendJson(res, 200, [])
     return
+  }
+
+  // Static file serving for GET requests
+  if (method === 'GET' && url) {
+    // Strip query string for file path resolution
+    const urlPath = url.split('?')[0]
+
+    // Try to serve from web/dist/
+    if (tryServeStatic(urlPath, res)) return
+
+    // SPA fallback: for paths that don't match a file, serve index.html
+    // (lets client-side routing work if we add it later)
+    if (urlPath !== '/' && !extname(urlPath) && WEB_DIST_EXISTS) {
+      if (tryServeStatic('/', res)) return
+    }
+
+    // No dist dir — show placeholder
+    if (url === '/' || url.startsWith('/?')) {
+      sendHtml(res, 200, PLACEHOLDER_HTML)
+      return
+    }
   }
 
   // 404 for everything else

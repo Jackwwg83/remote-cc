@@ -62,7 +62,7 @@ describe('startHttpServer', () => {
   // GET /
   // -------------------------------------------------------------------------
 
-  it('should return placeholder HTML on GET /', async () => {
+  it('should return HTML on GET / (web dist or placeholder)', async () => {
     await startTest()
 
     const res = await fetch(`${fetchUrl}/`)
@@ -70,8 +70,11 @@ describe('startHttpServer', () => {
     expect(res.headers.get('content-type')).toContain('text/html')
 
     const body = await res.text()
+    // Accepts either the Vite-built web UI or the placeholder
     expect(body).toContain('<title>remote-cc</title>')
-    expect(body).toContain('Web UI coming soon')
+    const hasWebDist = body.includes('id="root"')
+    const hasPlaceholder = body.includes('Web UI not built yet')
+    expect(hasWebDist || hasPlaceholder).toBe(true)
   })
 
   // -------------------------------------------------------------------------
@@ -108,10 +111,11 @@ describe('startHttpServer', () => {
   // 404
   // -------------------------------------------------------------------------
 
-  it('should return 404 for unknown routes', async () => {
+  it('should return 404 for unknown routes with file extension', async () => {
     await startTest()
 
-    const res = await fetch(`${fetchUrl}/nonexistent`)
+    // Use a path with an extension so it doesn't trigger SPA fallback
+    const res = await fetch(`${fetchUrl}/nonexistent.txt`)
     expect(res.status).toBe(404)
     expect(res.headers.get('content-type')).toContain('application/json')
 
@@ -139,8 +143,8 @@ describe('startHttpServer', () => {
     expect(res200.headers.get('access-control-allow-methods')).toContain('GET')
     expect(res200.headers.get('access-control-allow-methods')).not.toContain('POST')
 
-    // Check on a 404 response
-    const res404 = await fetch(`${fetchUrl}/nonexistent`)
+    // Check on a 404 response (use extension to avoid SPA fallback)
+    const res404 = await fetch(`${fetchUrl}/nonexistent.txt`)
     expect(res404.headers.get('access-control-allow-origin')).toBe('*')
   })
 
