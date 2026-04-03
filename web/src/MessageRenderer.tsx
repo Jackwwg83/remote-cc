@@ -75,7 +75,7 @@ function ToolUseBlock({ name, input }: { name: string; input: unknown }) {
         <span className="font-mono">{name}</span>
       </div>
       {display && (
-        <pre className={`mt-2 text-xs bg-gray-900 rounded p-2 overflow-x-auto whitespace-pre-wrap break-words ${
+        <pre className={`mt-2 text-xs bg-gray-900 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all ${
           isMono ? 'font-mono' : ''
         }`}>
           {display}
@@ -458,7 +458,9 @@ function TextBlock({ text }: { text: string }) {
     <div
       className="prose prose-invert prose-sm max-w-none
         [&_pre]:bg-gray-950 [&_pre]:rounded-md [&_pre]:p-3 [&_pre]:overflow-x-auto
-        [&_code]:text-sm [&_p]:leading-relaxed"
+        [&_code]:text-xs [&_code]:sm:text-sm [&_p]:leading-relaxed
+        [&_.hljs]:text-xs [&_.hljs]:sm:text-sm
+        break-words"
       dangerouslySetInnerHTML={{ __html: html }}
     />
   )
@@ -468,10 +470,11 @@ function ThinkingBlock({ thinking }: { thinking: string }) {
   return (
     <details className="my-2 group">
       <summary className="cursor-pointer text-xs text-gray-400 select-none
-        group-open:mb-1 hover:text-gray-300">
+        group-open:mb-1 hover:text-gray-300 min-h-[44px] flex items-center">
+        <span className="thinking-chevron inline-block transition-transform duration-200 mr-1 group-open:rotate-90">&#9654;</span>
         Thinking...
       </summary>
-      <div className="bg-gray-800/50 rounded-md p-3 text-xs text-gray-400 whitespace-pre-wrap break-words overflow-x-auto border border-gray-700/50">
+      <div className="thinking-content bg-gray-800/50 rounded-md p-3 text-xs text-gray-400 italic whitespace-pre-wrap break-words overflow-x-auto border border-gray-700/50">
         {thinking}
       </div>
     </details>
@@ -560,7 +563,7 @@ export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
     case 'assistant':
       return (
         <div className="flex justify-start mb-4">
-          <div className="max-w-[85%] md:max-w-[75%]">
+          <div className="max-w-[85%] sm:max-w-[70%]">
             <AssistantContent content={msg.message?.content} />
             {msg._streaming && (
               <span className="inline-block w-2 h-4 bg-blue-400 animate-pulse rounded-sm ml-0.5 align-text-bottom" />
@@ -572,7 +575,7 @@ export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
     case 'user':
       return (
         <div className="flex justify-end mb-4">
-          <div className="bg-blue-600 rounded-2xl rounded-br-md px-4 py-2 max-w-[85%] md:max-w-[75%]">
+          <div className="bg-blue-600 rounded-2xl rounded-br-md px-4 py-2 max-w-[85%] sm:max-w-[70%]">
             <p className="text-sm whitespace-pre-wrap break-words overflow-x-auto">
               {typeof msg.message?.content === 'string'
                 ? msg.message.content

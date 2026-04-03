@@ -6,6 +6,7 @@ import MessageRenderer, { type ChatMessage } from './MessageRenderer'
 import { createStreamingState, streamingToContent, type StreamingMessage } from './streamingState'
 import PermissionDialog, { type PermissionRequest, type PermissionAction } from './PermissionDialog'
 import InstallPrompt from './InstallPrompt'
+import QuickCommands from './QuickCommands'
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
@@ -285,7 +286,7 @@ export default function App() {
       )}
 
       {/* Messages */}
-      <main className="flex-1 overflow-y-auto p-4">
+      <main className="flex-1 overflow-y-auto px-2 py-4 sm:px-4">
         {messages.length === 0 && !streamingChatMsg && (
           <p className="text-gray-500 text-center mt-20">Send a message to get started</p>
         )}
@@ -299,7 +300,21 @@ export default function App() {
       </main>
 
       {/* Input */}
-      <footer className="p-4 border-t border-gray-700 shrink-0">
+      <footer className="px-2 py-2 sm:px-4 sm:py-4 border-t border-gray-700 shrink-0 pb-[env(safe-area-inset-bottom,8px)]">
+        {/* T-36: Quick command panel — mobile only */}
+        <QuickCommands
+          onCommand={(cmd) => {
+            if (!wsRef.current || status !== 'connected') return
+            const msg: ChatMessage = {
+              type: 'user',
+              message: { role: 'user', content: cmd },
+              parent_tool_use_id: null,
+              session_id: '',
+            }
+            setMessages((prev) => [...prev, msg])
+            wsRef.current.send(msg)
+          }}
+        />
         <div className="flex gap-2">
           <input
             type="text"
@@ -309,13 +324,13 @@ export default function App() {
             placeholder={status === 'connected' ? 'Type a message...' : 'Waiting for connection...'}
             disabled={status !== 'connected'}
             className="flex-1 bg-gray-800 text-white p-3 rounded-lg outline-none
-              focus:ring-2 focus:ring-blue-500
+              focus:ring-2 focus:ring-blue-500 min-h-[44px] text-base
               disabled:opacity-50 disabled:cursor-not-allowed"
           />
           <button
             onClick={sendMessage}
             disabled={status !== 'connected' || !input.trim()}
-            className="px-4 py-3 bg-blue-600 rounded-lg font-medium text-sm
+            className="px-4 py-3 bg-blue-600 rounded-lg font-medium text-sm min-h-[44px]
               hover:bg-blue-500 transition-colors
               disabled:opacity-50 disabled:cursor-not-allowed"
           >

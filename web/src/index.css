@@ -1,5 +1,30 @@
 @import "tailwindcss";
 
+/* T-35: Touch-friendly interactive elements on mobile */
+@media (max-width: 639px) {
+  main button,
+  main summary {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+}
+
+/* T-37: Smooth expand/collapse for thinking blocks */
+.thinking-content {
+  animation: thinking-expand 0.2s ease-out;
+}
+@keyframes thinking-expand {
+  from {
+    opacity: 0;
+    max-height: 0;
+  }
+  to {
+    opacity: 1;
+    max-height: 1000px;
+  }
+}
+
 /* T-23: Dark-mode overrides for diff2html */
 .diff-viewer-container .d2h-wrapper {
   background: transparent;

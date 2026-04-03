@@ -25,6 +25,7 @@ import { printStartupBanner } from './terminalUI.js'
 import { generateToken, createVerifyClient } from './auth.js'
 import { createMessageCache } from './messageCache.js'
 import { detectTailscale } from './tailscale.js'
+import { checkClaudeVersion } from './versionCheck.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -60,6 +61,16 @@ Options:
 
 async function main() {
   const port = parseInt(args.port ?? '7860', 10)
+
+  // -----------------------------------------------------------------------
+  // 0. T-38: Claude CLI version compatibility check (non-blocking)
+  // -----------------------------------------------------------------------
+  const versionResult = await checkClaudeVersion()
+  if (versionResult.warning) {
+    console.warn(`\n   ⚠  ${versionResult.warning}\n`)
+  } else if (versionResult.version) {
+    console.log(`   Claude CLI version: ${versionResult.version}`)
+  }
 
   // -----------------------------------------------------------------------
   // 1. Generate authentication token
