@@ -1,1 +1,44 @@
 @import "tailwindcss";
+
+/* T-23: Dark-mode overrides for diff2html */
+.diff-viewer-container .d2h-wrapper {
+  background: transparent;
+}
+.diff-viewer-container .d2h-file-wrapper {
+  border: none;
+  margin: 0;
+  background: #111827; /* gray-900 */
+}
+.diff-viewer-container .d2h-file-header {
+  display: none; /* we render our own header */
+}
+.diff-viewer-container .d2h-code-linenumber {
+  background: #1f2937; /* gray-800 */
+  color: #6b7280; /* gray-500 */
+  border-color: #374151; /* gray-700 */
+}
+.diff-viewer-container .d2h-code-line {
+  background: #111827; /* gray-900 */
+  color: #d1d5db; /* gray-300 */
+}
+.diff-viewer-container .d2h-ins .d2h-code-line,
+.diff-viewer-container .d2h-ins .d2h-code-linenumber {
+  background: rgba(22, 163, 74, 0.15); /* green tint */
+}
+.diff-viewer-container .d2h-del .d2h-code-line,
+.diff-viewer-container .d2h-del .d2h-code-linenumber {
+  background: rgba(220, 38, 38, 0.15); /* red tint */
+}
+.diff-viewer-container .d2h-info {
+  background: #1e293b;
+  color: #94a3b8;
+  border-color: #374151;
+}
+.diff-viewer-container .d2h-code-line ins {
+  background: rgba(22, 163, 74, 0.3);
+  text-decoration: none;
+}
+.diff-viewer-container .d2h-code-line del {
+  background: rgba(220, 38, 38, 0.3);
+  text-decoration: none;
+}

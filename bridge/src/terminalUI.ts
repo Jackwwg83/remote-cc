@@ -73,22 +73,27 @@ export function detectNetworkAddresses(): NetworkAddresses {
  *    Waiting for client connection...
  * ```
  */
-export function printStartupBanner(url: string, port: number): void {
+export function printStartupBanner(url: string, port: number, token?: string): void {
   const addrs = detectNetworkAddresses()
+  const qs = token ? `?token=${token}` : ''
 
   console.log()
   console.log(chalk.bold.cyan(`  remote-cc`) + chalk.dim(` v${VERSION}`))
   console.log()
-  console.log(`   ${chalk.dim('Local:')}      ${chalk.green(`http://localhost:${port}`)}`)
+  console.log(`   ${chalk.dim('Local:')}      ${chalk.green(`http://localhost:${port}${qs}`)}`)
   if (addrs.tailscale) {
     console.log(
-      `   ${chalk.dim('Tailscale:')}  ${chalk.green(`http://${addrs.tailscale}:${port}`)}`,
+      `   ${chalk.dim('Tailscale:')}  ${chalk.green(`http://${addrs.tailscale}:${port}${qs}`)}`,
     )
   }
   if (addrs.lan) {
     console.log(
-      `   ${chalk.dim('LAN:')}        ${chalk.green(`http://${addrs.lan}:${port}`)}`,
+      `   ${chalk.dim('LAN:')}        ${chalk.green(`http://${addrs.lan}:${port}${qs}`)}`,
     )
+  }
+  if (token) {
+    console.log()
+    console.log(`   ${chalk.dim('Token:')}      ${chalk.yellow(token)}`)
   }
   console.log()
   console.log(`   ${chalk.yellow('Waiting for client connection...')}`)
