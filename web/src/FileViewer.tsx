@@ -1,4 +1,7 @@
 // T-22: File viewer with syntax highlighting and line numbers
+// Renders highlighted code as a single <pre> block (never splitting highlighted HTML
+// by \n) to avoid breaking multiline <span> tags produced by highlight.js.
+// Line numbers are rendered in a separate gutter column.
 
 import { useState, useMemo, useCallback } from 'react'
 import hljs from 'highlight.js'
@@ -105,30 +108,33 @@ export default function FileViewer({ content, filePath }: FileViewerProps) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed)
   const [copied, setCopied] = useState(false)
 
+  const visibleLines = collapsed ? lines.slice(0, COLLAPSED_LINE_THRESHOLD) : lines
+  const visibleLineCount = visibleLines.length
+
+  // Highlight the visible code as a single block — never split the result by \n.
+  // highlight.js may produce multiline <span> tags that would break if split.
   const highlighted = useMemo(() => {
-    const code = lines.join('\n')
+    const code = visibleLines.join('\n')
     if (language !== 'plaintext' && hljs.getLanguage(language)) {
       try {
         return hljs.highlight(code, { language }).value
       } catch {
-        // Fall through to plain
+        // Fall through to auto
       }
     }
     return hljs.highlightAuto(code).value
-  }, [lines, language])
+  }, [visibleLines, language])
 
-  // Split highlighted HTML back into lines for line-number rendering
-  const highlightedLines = useMemo(() => highlighted.split('\n'), [highlighted])
+  // Build the line number gutter as plain text (one number per line)
+  const gutterText = useMemo(() => {
+    return Array.from({ length: visibleLineCount }, (_, i) => startLine + i).join('\n')
+  }, [visibleLineCount, startLine])
 
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(lines.join('\n'))
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }, [lines])
-
-  const visibleLines = collapsed
-    ? highlightedLines.slice(0, COLLAPSED_LINE_THRESHOLD)
-    : highlightedLines
 
   const fileName = filePath.split('/').pop() ?? filePath
 
@@ -151,27 +157,22 @@ export default function FileViewer({ content, filePath }: FileViewerProps) {
         </button>
       </div>
 
-      {/* Code with line numbers */}
-      <div className="overflow-x-auto">
-        <table className="w-full border-collapse">
-          <tbody>
-            {visibleLines.map((lineHtml, i) => (
-              <tr key={i} className="hover:bg-gray-800/50">
-                <td className="text-right pr-3 pl-3 py-0 select-none text-xs text-gray-600 font-mono align-top w-1 whitespace-nowrap border-r border-gray-700/30">
-                  {startLine + i}
-                </td>
-                <td className="pl-3 pr-3 py-0">
-                  <pre className="text-xs font-mono leading-5">
-                    <code
-                      className="hljs"
-                      dangerouslySetInnerHTML={{ __html: lineHtml || '&nbsp;' }}
-                    />
-                  </pre>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {/* Code with line number gutter — two synchronized <pre> blocks side by side */}
+      <div className="overflow-x-auto flex">
+        {/* Line number gutter */}
+        <pre
+          className="text-xs font-mono leading-5 py-1 px-3 m-0 bg-transparent text-gray-600 text-right select-none shrink-0 border-r border-gray-700/30"
+          aria-hidden="true"
+        >
+          {gutterText}
+        </pre>
+        {/* Code block — rendered as a single highlighted <pre>, no line splitting */}
+        <pre className="text-xs font-mono leading-5 py-1 px-3 m-0 bg-transparent flex-1 min-w-0">
+          <code
+            className="hljs"
+            dangerouslySetInnerHTML={{ __html: highlighted }}
+          />
+        </pre>
       </div>
 
       {/* Collapse/expand controls */}

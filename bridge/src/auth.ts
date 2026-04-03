@@ -46,21 +46,36 @@ export type VerifyClientCallback = (
 ) => void
 
 /**
- * Create a `verifyClient` function that checks the Authorization header
- * against the provided token.
+ * Create a `verifyClient` function that checks the token via:
+ *   1. `Authorization: Bearer <token>` header (preferred, for CLI/native clients)
+ *   2. `?token=<token>` query parameter (fallback, for browser WebSocket which
+ *      cannot set custom headers on `new WebSocket(url)`)
  *
- * Accepts: `Authorization: Bearer <token>`
- * Rejects: missing header, wrong format, wrong token → HTTP 401
+ * Rejects: missing/wrong token → HTTP 401
  */
 export function createVerifyClient(
   token: string,
 ): (info: VerifyClientInfo, cb: VerifyClientCallback) => void {
   return (info: VerifyClientInfo, cb: VerifyClientCallback) => {
+    // 1. Check Authorization header first
     const authHeader = info.req.headers['authorization']
     if (authHeader === `Bearer ${token}`) {
       cb(true)
-    } else {
-      cb(false, 401, 'Unauthorized')
+      return
     }
+
+    // 2. Fallback: check ?token= query parameter
+    try {
+      const url = new URL(info.req.url ?? '', `http://${info.req.headers.host}`)
+      const queryToken = url.searchParams.get('token')
+      if (queryToken === token) {
+        cb(true)
+        return
+      }
+    } catch {
+      // Malformed URL — fall through to reject
+    }
+
+    cb(false, 401, 'Unauthorized')
   }
 }

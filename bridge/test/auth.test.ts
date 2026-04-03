@@ -142,6 +142,74 @@ describe('createVerifyClient', () => {
     expect(accepted).toBe(false)
     expect(statusCode).toBe(401)
   })
+
+  // -------------------------------------------------------------------------
+  // Query parameter fallback (browser WebSocket can't set headers)
+  // -------------------------------------------------------------------------
+
+  it('should accept a valid token via ?token= query parameter', () => {
+    const verifyClient = createVerifyClient(token)
+    const req = {
+      headers: { host: 'localhost:7860' },
+      url: `/?token=${token}`,
+    } as any
+
+    let accepted: boolean | undefined
+    let statusCode: number | undefined
+
+    verifyClient({ req }, (result, code) => {
+      accepted = result
+      statusCode = code
+    })
+
+    expect(accepted).toBe(true)
+    expect(statusCode).toBeUndefined()
+  })
+
+  it('should reject a wrong token via query parameter', () => {
+    const verifyClient = createVerifyClient(token)
+    const req = {
+      headers: { host: 'localhost:7860' },
+      url: '/?token=wrong-token',
+    } as any
+
+    let accepted: boolean | undefined
+    let statusCode: number | undefined
+
+    verifyClient({ req }, (result, code) => {
+      accepted = result
+      statusCode = code
+    })
+
+    expect(accepted).toBe(false)
+    expect(statusCode).toBe(401)
+  })
+
+  it('should prefer Authorization header over query parameter', () => {
+    const verifyClient = createVerifyClient(token)
+    // Both header and query provided — header is correct
+    const req = {
+      headers: { authorization: `Bearer ${token}`, host: 'localhost:7860' },
+      url: '/?token=wrong-token',
+    } as any
+
+    let accepted: boolean | undefined
+    verifyClient({ req }, (result) => { accepted = result })
+    expect(accepted).toBe(true)
+  })
+
+  it('should fall through to query param when header is wrong', () => {
+    const verifyClient = createVerifyClient(token)
+    const req = {
+      headers: { authorization: 'Bearer wrong', host: 'localhost:7860' },
+      url: `/?token=${token}`,
+    } as any
+
+    let accepted: boolean | undefined
+    verifyClient({ req }, (result) => { accepted = result })
+    // Header check fails, but query param matches
+    expect(accepted).toBe(true)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -286,5 +354,42 @@ describe('auth + wsServer integration', () => {
     ws.send('from-client')
     await tick()
     expect(serverReceived).toContain('from-client')
+  })
+
+  it('should accept connection with valid token in query parameter', async () => {
+    const token = 'rcc_valid-test-token'
+    const env = await createTestServer(token)
+    httpServer = env.httpServer
+    wsServer = env.wsServer
+
+    // Browser WebSocket can't set headers, so token goes in the URL
+    const ws = await new Promise<WebSocket>((resolve, reject) => {
+      const client = new WebSocket(`${env.url}?token=${token}`)
+      client.on('open', () => resolve(client))
+      client.on('error', reject)
+    })
+    openClients.push(ws)
+
+    await tick()
+    expect(wsServer.clientCount()).toBe(1)
+  })
+
+  it('should reject connection with wrong token in query parameter', async () => {
+    const token = 'rcc_valid-test-token'
+    const env = await createTestServer(token)
+    httpServer = env.httpServer
+    wsServer = env.wsServer
+
+    const result = await new Promise<'error' | 'open'>((resolve) => {
+      const client = new WebSocket(`${env.url}?token=rcc_wrong-token`)
+      client.on('open', () => {
+        openClients.push(client)
+        resolve('open')
+      })
+      client.on('error', () => resolve('error'))
+    })
+
+    expect(result).toBe('error')
+    expect(wsServer.clientCount()).toBe(0)
   })
 })

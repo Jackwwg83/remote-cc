@@ -8,7 +8,15 @@ import PermissionDialog, { type PermissionRequest, type PermissionAction } from 
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
-  return params.get('ws') ?? 'ws://localhost:7860'
+  const base = params.get('ws') ?? 'ws://localhost:7860'
+  // Pass the auth token from page URL to WebSocket URL as a query parameter,
+  // since browser WebSocket cannot set custom headers.
+  const token = params.get('token')
+  if (token) {
+    const sep = base.includes('?') ? '&' : '?'
+    return `${base}${sep}token=${encodeURIComponent(token)}`
+  }
+  return base
 }
 
 export default function App() {

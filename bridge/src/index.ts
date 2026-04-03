@@ -84,15 +84,17 @@ async function main() {
   let seq = 0
 
   // On new connection, check ?last_seq query param and replay cached messages
+  // Replayed messages use the same seq envelope format as live broadcasts.
   ws.onConnection((socket, req) => {
     const urlObj = new URL(req.url ?? '/', 'http://localhost')
     const lastSeqParam = urlObj.searchParams.get('last_seq')
     if (lastSeqParam !== null) {
       const lastSeq = parseInt(lastSeqParam, 10)
       if (!Number.isNaN(lastSeq)) {
-        const missed = cache.replay(lastSeq)
-        for (const msg of missed) {
-          socket.send(msg)
+        const missed = cache.replayWithSeq(lastSeq)
+        for (const entry of missed) {
+          const envelope = JSON.stringify({ seq: entry.seq, data: entry.message })
+          socket.send(envelope)
         }
         if (missed.length > 0) {
           console.log(`   Replay: ${missed.length} cached messages from seq ${lastSeq + 1}`)
@@ -175,15 +177,18 @@ async function main() {
   })
 
   // claude → cache + broadcast to all clients (continuous read loop)
+  // Each message is wrapped in a seq envelope: {"seq": N, "data": "<original JSON>"}
+  // so the web client can track its position and request replay on reconnect.
   ;(async () => {
     try {
       for (;;) {
         const { value, done } = await iterator.next()
         if (done) break
-        // Assign sequence number, cache, then broadcast
+        // Assign sequence number, cache raw message, broadcast with seq envelope
         seq++
         cache.push(value, seq)
-        ws.broadcast(value)
+        const envelope = JSON.stringify({ seq, data: value })
+        ws.broadcast(envelope)
       }
     } catch (err) {
       console.error('Error reading claude stdout:', err)

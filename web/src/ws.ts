@@ -1,15 +1,35 @@
 // T-09: WebSocket client for remote-cc web UI
+// Supports seq envelope unwrapping and last_seq reconnect replay.
 
 type WsState = 'connecting' | 'connected' | 'disconnected'
 type MessageCallback = (data: unknown) => void
 type StateCallback = (state: WsState) => void
 type ErrorCallback = (err: Event) => void
 
-export function connectWs(url: string) {
+/** Seq envelope sent by the bridge: {"seq": N, "data": "<original JSON>"} */
+interface SeqEnvelope {
+  seq: number
+  data: string
+}
+
+function isSeqEnvelope(obj: unknown): obj is SeqEnvelope {
+  return (
+    typeof obj === 'object' &&
+    obj !== null &&
+    'seq' in obj &&
+    'data' in obj &&
+    typeof (obj as SeqEnvelope).seq === 'number' &&
+    typeof (obj as SeqEnvelope).data === 'string'
+  )
+}
+
+export function connectWs(baseUrl: string) {
   const messageCallbacks: MessageCallback[] = []
   const stateCallbacks: StateCallback[] = []
   const errorCallbacks: ErrorCallback[] = []
   let ws: WebSocket | null = null
+  let lastSeq = 0
+  let intentionalClose = false
 
   function notify(state: WsState) {
     for (const cb of stateCallbacks) {
@@ -17,9 +37,17 @@ export function connectWs(url: string) {
     }
   }
 
+  /** Build the WS URL, appending last_seq for reconnect replay. */
+  function buildUrl(): string {
+    if (lastSeq === 0) return baseUrl
+    const sep = baseUrl.includes('?') ? '&' : '?'
+    return `${baseUrl}${sep}last_seq=${lastSeq}`
+  }
+
   function open() {
+    intentionalClose = false
     notify('connecting')
-    ws = new WebSocket(url)
+    ws = new WebSocket(buildUrl())
 
     ws.onopen = () => notify('connected')
 
@@ -38,13 +66,28 @@ export function connectWs(url: string) {
     }
 
     ws.onmessage = (ev: MessageEvent) => {
-      let data: unknown
+      let parsed: unknown
       try {
-        data = JSON.parse(ev.data as string)
+        parsed = JSON.parse(ev.data as string)
       } catch {
         // Non-JSON message — pass raw string
-        data = ev.data
+        parsed = ev.data
       }
+
+      // Unwrap seq envelope if present
+      let data: unknown
+      if (isSeqEnvelope(parsed)) {
+        lastSeq = parsed.seq
+        try {
+          data = JSON.parse(parsed.data)
+        } catch {
+          data = parsed.data
+        }
+      } else {
+        // Legacy or non-enveloped message — pass through as-is
+        data = parsed
+      }
+
       for (const cb of messageCallbacks) {
         try { cb(data) } catch { /* swallow listener errors */ }
       }
@@ -81,13 +124,29 @@ export function connectWs(url: string) {
       }
     },
 
+    /** Reconnect with last_seq for replay of missed messages. */
+    reconnect() {
+      if (ws) {
+        ws.onclose = null
+        ws.close()
+        ws = null
+      }
+      open()
+    },
+
     close() {
+      intentionalClose = true
       if (ws) {
         ws.onclose = null  // prevent state notification on intentional close
         ws.close()
         ws = null
         notify('disconnected')
       }
+    },
+
+    /** Return the last received sequence number. */
+    getLastSeq() {
+      return lastSeq
     },
   }
 }
