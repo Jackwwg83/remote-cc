@@ -1,31 +1,28 @@
 /**
- * initializer.ts — Handle the initialize handshake with claude.
+ * initializer.ts — Wait for claude's init message before bridging.
  *
- * When claude starts in stream-json mode, its first stdout message is a
- * `control_request` with `subtype: 'initialize'`. The bridge must reply
- * with a `control_response` containing session configuration, otherwise
- * claude will not process any user messages.
+ * When claude starts in `--print --output-format stream-json` mode, its
+ * first stdout message is `{"type":"system","subtype":"init",...}` containing
+ * session config (tools, model, session_id, etc.).
  *
- * This module reads lines from claude's stdout, detects the initialize
- * request, sends the response to stdin, and transparently yields all
- * other messages (system status, etc.) that arrive before the handshake.
+ * The bridge waits for this message to confirm claude is ready, then starts
+ * the bidirectional message bridge. No response to stdin is needed.
  */
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-/** Messages received before initialize completes — passed through, not dropped. */
-export interface InitializeResult {
-  /** The request_id from the initialize control_request. */
-  requestId: string
-  /** Any raw JSON lines that arrived before the initialize request. */
+export interface InitResult {
+  /** The parsed init message from claude. */
+  initMessage: Record<string, unknown>
+  /** Any raw JSON lines that arrived before the init message (e.g., hook events). */
   preInitMessages: string[]
 }
 
 export class InitializeTimeoutError extends Error {
   constructor(timeoutMs: number) {
-    super(`Timed out waiting for initialize request after ${timeoutMs}ms`)
+    super(`Timed out waiting for claude init message after ${timeoutMs}ms`)
     this.name = 'InitializeTimeoutError'
   }
 }
@@ -34,35 +31,33 @@ export class InitializeTimeoutError extends Error {
 // Constants
 // ---------------------------------------------------------------------------
 
-export const INITIALIZE_TIMEOUT_MS = 10_000
+export const INITIALIZE_TIMEOUT_MS = 15_000
 
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
 /**
- * Wait for claude's initialize handshake and reply.
+ * Wait for claude's `system.init` message.
  *
  * Uses the iterator's `.next()` method directly (instead of `for-await`)
  * so the async generator from `createLineReader` is NOT closed on return.
  * This allows the caller to continue reading post-init messages from the
  * same iterator.
  *
- * @param iterator - An AsyncIterator of raw JSON lines (created from createLineReader)
- * @param writeToStdin - Callback to write a JSON object to claude stdin
- * @param timeoutMs - Timeout in ms (default: 10000)
- * @returns The request_id and any pre-init messages (raw JSON strings)
- * @throws InitializeTimeoutError if no initialize request within timeout
+ * @param iterator - An AsyncIterator of raw JSON lines
+ * @param timeoutMs - Timeout in ms (default: 15000)
+ * @returns The init message and any pre-init messages
+ * @throws InitializeTimeoutError if no init message within timeout
  */
 export async function waitForInitialize(
   iterator: AsyncIterator<string>,
-  writeToStdin: (obj: unknown) => void,
+  _writeToStdin?: (obj: unknown) => void, // kept for API compat, not used
   timeoutMs: number = INITIALIZE_TIMEOUT_MS,
-): Promise<InitializeResult> {
+): Promise<InitResult> {
   const preInitMessages: string[] = []
 
-  // Race the line iteration against a timeout
-  return new Promise<InitializeResult>((resolve, reject) => {
+  return new Promise<InitResult>((resolve, reject) => {
     let settled = false
 
     const timer = setTimeout(() => {
@@ -78,11 +73,10 @@ export async function waitForInitialize(
           const result = await iterator.next()
 
           if (result.done) {
-            // Stream ended without initialize
             if (!settled) {
               settled = true
               clearTimeout(timer)
-              reject(new Error('Stream ended before initialize request was received'))
+              reject(new Error('Stream ended before init message was received'))
             }
             return
           }
@@ -91,53 +85,64 @@ export async function waitForInitialize(
 
           const line = result.value
 
-          // Skip empty lines
           if (!line.trim()) continue
 
           let msg: Record<string, unknown>
           try {
             msg = JSON.parse(line) as Record<string, unknown>
           } catch {
-            // Malformed JSON — skip (per protocol-spec §6: log warning, don't crash)
+            // Malformed JSON — skip
             continue
           }
 
-          // Check if this is the initialize control_request
+          // Claude sends {"type":"system","subtype":"init",...} as its first message
+          if (msg.type === 'system' && msg.subtype === 'init') {
+            settled = true
+            clearTimeout(timer)
+            resolve({
+              initMessage: msg,
+              preInitMessages,
+            })
+            return
+          }
+
+          // Also accept control_request initialize (SDK mode, for forward compat)
           if (
             msg.type === 'control_request' &&
             typeof msg.request === 'object' &&
             msg.request !== null &&
             (msg.request as Record<string, unknown>).subtype === 'initialize'
           ) {
-            const requestId = msg.request_id as string
-
-            // Send the initialize response
-            writeToStdin({
-              type: 'control_response',
-              response: {
-                subtype: 'success',
-                request_id: requestId,
+            // In SDK mode, we need to respond
+            if (_writeToStdin) {
+              const requestId = (msg as Record<string, unknown>).request_id as string
+              _writeToStdin({
+                type: 'control_response',
                 response: {
-                  commands: [],
-                  agents: [],
-                  output_style: 'normal',
-                  available_output_styles: ['normal'],
-                  models: [],
-                  account: {},
-                  pid: process.pid,
+                  subtype: 'success',
+                  request_id: requestId,
+                  response: {
+                    commands: [],
+                    agents: [],
+                    output_style: 'normal',
+                    available_output_styles: ['normal'],
+                    models: [],
+                    account: {},
+                    pid: process.pid,
+                  },
                 },
-              },
-            })
-
-            if (!settled) {
-              settled = true
-              clearTimeout(timer)
-              resolve({ requestId, preInitMessages })
+              })
             }
+            settled = true
+            clearTimeout(timer)
+            resolve({
+              initMessage: msg,
+              preInitMessages,
+            })
             return
           }
 
-          // Not the initialize request — collect as pre-init message (raw JSON string)
+          // Pre-init messages (hook events, etc.) — collect but don't drop
           preInitMessages.push(line)
         }
       } catch (err) {
@@ -149,6 +154,6 @@ export async function waitForInitialize(
       }
     }
 
-    iterate()
+    void iterate()
   })
 }
