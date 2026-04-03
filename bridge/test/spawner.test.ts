@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest'
-import { spawnClaude, SpawnError, type ClaudeProcess } from '../src/spawner.js'
+import { spawnClaude, SpawnError, CLAUDE_ARGS, type ClaudeProcess } from '../src/spawner.js'
 import { tmpdir } from 'node:os'
 
 // Track spawned processes so we can clean up even if a test fails
@@ -131,6 +131,24 @@ describe('spawn failure', () => {
     // ENOENT fires 'error' on ChildProcess, which we map to exit(1, null)
     expect(exitResult.code).toBe(1)
   })
+
+  it('should emit exit only once on ENOENT (no duplicate from close)', async () => {
+    const proc = spawnClaude(tmpdir(), {
+      command: '__nonexistent_command_for_test__',
+      _rawArgs: [],
+    })
+    spawned.push(proc)
+
+    let exitCount = 0
+    proc.on('exit', () => {
+      exitCount++
+    })
+
+    // Wait long enough for both 'error' and 'close' to fire
+    await new Promise(r => setTimeout(r, 500))
+
+    expect(exitCount).toBe(1)
+  })
 })
 
 describe('process exit handling', () => {
@@ -203,6 +221,25 @@ describe('kill', () => {
     proc.kill() // should not throw
 
     await exitResult // should resolve without error
+  })
+})
+
+describe('CLAUDE_ARGS constant', () => {
+  it('should contain all 7 required flags for stream-json communication', () => {
+    expect(CLAUDE_ARGS).toContain('--print')
+    expect(CLAUDE_ARGS).toContain('--input-format')
+    expect(CLAUDE_ARGS).toContain('--output-format')
+    expect(CLAUDE_ARGS).toContain('--verbose')
+    expect(CLAUDE_ARGS).toContain('--include-partial-messages')
+    expect(CLAUDE_ARGS).toContain('--include-hook-events')
+    expect(CLAUDE_ARGS).toContain('--replay-user-messages')
+
+    // Verify stream-json is the format for both input and output
+    const args = [...CLAUDE_ARGS]
+    const inputIdx = args.indexOf('--input-format')
+    const outputIdx = args.indexOf('--output-format')
+    expect(args[inputIdx + 1]).toBe('stream-json')
+    expect(args[outputIdx + 1]).toBe('stream-json')
   })
 })
 

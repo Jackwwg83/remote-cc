@@ -43,7 +43,7 @@ export class SpawnError extends Error {
 // Constants
 // ---------------------------------------------------------------------------
 
-const CLAUDE_ARGS = [
+export const CLAUDE_ARGS = [
   '--print',
   '--input-format', 'stream-json',
   '--output-format', 'stream-json',
@@ -60,22 +60,29 @@ const CLAUDE_ARGS = [
 class ClaudeProcessImpl extends EventEmitter implements ClaudeProcess {
   private readonly child: ChildProcess
 
-  constructor(child: ChildProcess) {
+  constructor(child: ChildProcess, onExit?: () => void) {
     super()
     this.child = child
 
+    // Guard against emitting 'exit' twice (ENOENT fires both 'error' and 'close')
+    let exitFired = false
+
     // Forward close event as 'exit'
     child.on('close', (code, signal) => {
-      this.emit('exit', code, signal)
+      if (!exitFired) {
+        exitFired = true
+        onExit?.()
+        this.emit('exit', code, signal)
+      }
     })
 
     // Spawn-level errors (e.g. ENOENT after spawn returns) also emit 'exit'
-    child.on('error', (err) => {
-      // 'error' fires before 'close' for ENOENT; emit exit with code 1
-      // so callers see a single consistent event.
-      // Note: 'close' may still fire after 'error'. We let both through;
-      // callers should be prepared for multiple 'exit' events or use `once`.
-      this.emit('exit', 1, null)
+    child.on('error', (_err) => {
+      if (!exitFired) {
+        exitFired = true
+        onExit?.()
+        this.emit('exit', 1, null)
+      }
     })
   }
 
@@ -170,11 +177,12 @@ export function spawnClaude(cwd: string, opts?: SpawnClaudeOptions): ClaudeProce
   process.on('SIGTERM', onSigterm)
   process.on('SIGINT', onSigint)
 
-  // Clean up signal listeners when child exits
-  child.on('close', () => {
+  // Clean up signal listeners when child exits (via onExit callback,
+  // which fires from whichever of 'close' or 'error' comes first)
+  const cleanupSignals = () => {
     process.removeListener('SIGTERM', onSigterm)
     process.removeListener('SIGINT', onSigint)
-  })
+  }
 
-  return new ClaudeProcessImpl(child)
+  return new ClaudeProcessImpl(child, cleanupSignals)
 }
