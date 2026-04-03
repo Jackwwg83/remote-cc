@@ -3,10 +3,12 @@
 type WsState = 'connecting' | 'connected' | 'disconnected'
 type MessageCallback = (data: unknown) => void
 type StateCallback = (state: WsState) => void
+type ErrorCallback = (err: Event) => void
 
 export function connectWs(url: string) {
   const messageCallbacks: MessageCallback[] = []
   const stateCallbacks: StateCallback[] = []
+  const errorCallbacks: ErrorCallback[] = []
   let ws: WebSocket | null = null
 
   function notify(state: WsState) {
@@ -26,8 +28,13 @@ export function connectWs(url: string) {
       notify('disconnected')
     }
 
-    ws.onerror = () => {
+    ws.onerror = (ev: Event) => {
+      // Surface the error to listeners
+      for (const cb of errorCallbacks) {
+        try { cb(ev) } catch { /* swallow listener errors */ }
+      }
       // onerror always fires before onclose; onclose handles state
+      notify('disconnected')
     }
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -55,6 +62,10 @@ export function connectWs(url: string) {
 
     onMessage(cb: MessageCallback) {
       messageCallbacks.push(cb)
+    },
+
+    onError(cb: ErrorCallback) {
+      errorCallbacks.push(cb)
     },
 
     onStateChange(cb: StateCallback) {

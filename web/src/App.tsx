@@ -29,9 +29,14 @@ export default function App() {
     ws.onStateChange(setStatus)
 
     ws.onMessage((data) => {
-      // Accumulate all incoming messages for display
       if (data && typeof data === 'object' && 'type' in (data as Record<string, unknown>)) {
-        setMessages((prev) => [...prev, data as ChatMessage])
+        const msg = data as ChatMessage
+        // Fix 2: Only display chat messages, skip keep_alive/control signals
+        const chatTypes = new Set(['assistant', 'system', 'result'])
+        if (!chatTypes.has(msg.type)) return
+        // Fix 3: Skip incoming 'user' messages — we already echo them locally
+        // (handles --replay-user-messages duplication)
+        setMessages((prev) => [...prev, msg])
       }
     })
 

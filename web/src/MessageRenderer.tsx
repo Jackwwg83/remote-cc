@@ -49,7 +49,7 @@ function ThinkingBlock({ thinking }: { thinking: string }) {
         group-open:mb-1 hover:text-gray-300">
         Thinking...
       </summary>
-      <div className="bg-gray-800/50 rounded-md p-3 text-xs text-gray-400 whitespace-pre-wrap border border-gray-700/50">
+      <div className="bg-gray-800/50 rounded-md p-3 text-xs text-gray-400 whitespace-pre-wrap break-words overflow-x-auto border border-gray-700/50">
         {thinking}
       </div>
     </details>
@@ -61,10 +61,20 @@ function ToolUseBlock({ name, input }: { name: string; input: unknown }) {
     <div className="my-2 bg-gray-800 rounded-md border border-gray-700/50 overflow-hidden">
       <div className="px-3 py-1.5 bg-gray-750 border-b border-gray-700/50 flex items-center gap-2">
         <span className="text-xs font-mono text-yellow-400/80">tool</span>
-        <span className="text-sm font-mono text-gray-200">{name}</span>
+        <span className="text-sm font-mono text-gray-200 break-words overflow-x-auto">{name}</span>
       </div>
-      <pre className="p-3 text-xs text-gray-400 overflow-x-auto">
+      <pre className="p-3 text-xs text-gray-400 overflow-x-auto break-words">
         {JSON.stringify(input, null, 2)}
+      </pre>
+    </div>
+  )
+}
+
+function ToolResultBlock({ content }: { content: unknown }) {
+  return (
+    <div className="bg-gray-800 rounded p-2 text-sm">
+      <pre className="whitespace-pre-wrap break-all overflow-x-auto">
+        {typeof content === 'string' ? content : JSON.stringify(content, null, 2)}
       </pre>
     </div>
   )
@@ -81,18 +91,32 @@ function AssistantContent({ content }: { content: unknown }) {
   }
   return (
     <>
-      {content.map((block: Record<string, unknown>, i: number) => {
-        switch (block.type) {
+      {content.map((block: unknown, i: number) => {
+        // Fix 5: Guard against null, string, or non-object entries in content array
+        if (typeof block === 'string') {
+          return <TextBlock key={i} text={block} />
+        }
+        if (typeof block !== 'object' || block === null || !('type' in block)) {
+          return (
+            <pre key={i} className="text-xs text-gray-500 my-1 break-words overflow-x-auto">
+              {JSON.stringify(block, null, 2)}
+            </pre>
+          )
+        }
+        const b = block as Record<string, unknown>
+        switch (b.type) {
           case 'text':
-            return <TextBlock key={i} text={block.text as string} />
+            return <TextBlock key={i} text={b.text as string} />
           case 'thinking':
-            return <ThinkingBlock key={i} thinking={block.thinking as string} />
+            return <ThinkingBlock key={i} thinking={b.thinking as string} />
           case 'tool_use':
-            return <ToolUseBlock key={i} name={block.name as string} input={block.input} />
+            return <ToolUseBlock key={i} name={b.name as string} input={b.input} />
+          case 'tool_result':
+            return <ToolResultBlock key={i} content={b.content} />
           default:
             return (
-              <pre key={i} className="text-xs text-gray-500 my-1">
-                {JSON.stringify(block, null, 2)}
+              <pre key={i} className="text-xs text-gray-500 my-1 break-words overflow-x-auto">
+                {JSON.stringify(b, null, 2)}
               </pre>
             )
         }
@@ -127,7 +151,7 @@ export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
       return (
         <div className="flex justify-end mb-4">
           <div className="bg-blue-600 rounded-2xl rounded-br-md px-4 py-2 max-w-[85%] md:max-w-[75%]">
-            <p className="text-sm whitespace-pre-wrap">
+            <p className="text-sm whitespace-pre-wrap break-words overflow-x-auto">
               {typeof msg.message?.content === 'string'
                 ? msg.message.content
                 : JSON.stringify(msg.message?.content)}
@@ -139,7 +163,7 @@ export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
     case 'system':
       return (
         <div className="flex justify-center mb-4">
-          <p className="text-xs text-gray-500 bg-gray-800/50 rounded-full px-4 py-1">
+          <p className="text-xs text-gray-500 bg-gray-800/50 rounded-full px-4 py-1 break-words overflow-x-auto">
             {typeof msg.message?.content === 'string'
               ? msg.message.content
               : JSON.stringify(msg.message)}
@@ -150,7 +174,7 @@ export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
     case 'result':
       return (
         <div className="flex justify-center mb-4">
-          <p className="text-xs text-gray-400 italic">
+          <p className="text-xs text-gray-400 italic break-words overflow-x-auto">
             {typeof msg.message?.content === 'string'
               ? msg.message.content
               : `Result: ${JSON.stringify(msg.message ?? msg)}`}
@@ -166,7 +190,7 @@ export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
             <summary className="text-xs text-gray-500 cursor-pointer">
               Unknown message type: {msg.type ?? 'undefined'}
             </summary>
-            <pre className="text-xs text-gray-600 mt-1 bg-gray-800/50 rounded p-2 overflow-x-auto">
+            <pre className="text-xs text-gray-600 mt-1 bg-gray-800/50 rounded p-2 overflow-x-auto break-words">
               {JSON.stringify(msg, null, 2)}
             </pre>
           </details>
