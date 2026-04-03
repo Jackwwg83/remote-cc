@@ -1,9 +1,10 @@
-// T-10/T-13/T-14: Chat interface with streaming support for remote-cc web UI
+// T-10/T-13/T-14/T-19-21: Chat interface with streaming + permission approval for remote-cc web UI
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { connectWs } from './ws'
 import MessageRenderer, { type ChatMessage } from './MessageRenderer'
 import { createStreamingState, streamingToContent, type StreamingMessage } from './streamingState'
+import PermissionDialog, { type PermissionRequest, type PermissionAction } from './PermissionDialog'
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
@@ -15,6 +16,8 @@ export default function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [streamingMsg, setStreamingMsg] = useState<StreamingMessage | null>(null)
   const [input, setInput] = useState('')
+  // T-19: Pending permission requests (Map<request_id, PermissionRequest>)
+  const [pendingPerms, setPendingPerms] = useState<Map<string, PermissionRequest>>(new Map())
   const bottomRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<ReturnType<typeof connectWs> | null>(null)
   const streamStateRef = useRef(createStreamingState())
@@ -106,6 +109,19 @@ export default function App() {
         return
       }
 
+      // T-19: control_request (permission approval)
+      if (d.type === 'control_request') {
+        const req = data as PermissionRequest
+        if (req.request?.subtype === 'can_use_tool') {
+          setPendingPerms((prev) => {
+            const next = new Map(prev)
+            next.set(req.request_id, req)
+            return next
+          })
+        }
+        return
+      }
+
       // Other chat message types
       const chatTypes = new Set(['system', 'result'])
       if (chatTypes.has(d.type as string)) {
@@ -148,6 +164,37 @@ export default function App() {
       sendMessage()
     }
   }
+
+  // T-20: Send control_response and remove from pending
+  const handlePermission = useCallback((action: PermissionAction) => {
+    if (!wsRef.current) return
+
+    if (action.behavior === 'allow') {
+      wsRef.current.send({
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: action.requestId,
+          response: { behavior: 'allow', updatedInput: null },
+        },
+      })
+    } else {
+      wsRef.current.send({
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: action.requestId,
+          response: { behavior: 'deny', message: 'User denied this operation' },
+        },
+      })
+    }
+
+    setPendingPerms((prev) => {
+      const next = new Map(prev)
+      next.delete(action.requestId)
+      return next
+    })
+  }, [])
 
   // Build the streaming ChatMessage to display at the bottom
   const streamingChatMsg: ChatMessage | null = streamingMsg
@@ -217,6 +264,12 @@ export default function App() {
           </button>
         </div>
       </footer>
+
+      {/* T-19: Permission dialog — show first pending request */}
+      {pendingPerms.size > 0 && (() => {
+        const first = pendingPerms.values().next().value as PermissionRequest
+        return <PermissionDialog request={first} onRespond={handlePermission} />
+      })()}
     </div>
   )
 }
