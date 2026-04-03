@@ -12,7 +12,8 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws'
-import type { Server as HttpServer } from 'node:http'
+import type { Server as HttpServer, IncomingMessage } from 'node:http'
+import type { VerifyClientInfo, VerifyClientCallback } from './auth.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -25,11 +26,19 @@ const BACKPRESSURE_THRESHOLD = 1_048_576 // 1 MB
 // Types
 // ---------------------------------------------------------------------------
 
+/** Optional configuration for createWsServer. */
+export interface WsServerOptions {
+  /** ws verifyClient function for authentication. */
+  verifyClient?: (info: VerifyClientInfo, cb: VerifyClientCallback) => void
+}
+
 export interface WsServer {
   /** Send a string to all connected clients. */
   broadcast(data: string): void
   /** Register a callback for messages received from any client. */
   onMessage(cb: (data: string) => void): void
+  /** Register a callback for new connections. Receives the WebSocket and upgrade request. */
+  onConnection(cb: (socket: WebSocket, req: IncomingMessage) => void): void
   /** Number of currently connected clients. */
   clientCount(): number
   /** Shut down the WebSocket server and disconnect all clients. */
@@ -53,15 +62,26 @@ export interface WsServer {
  * handle protocol logic like permission approval.
  *
  * @param httpServer - An existing http.Server to attach to
+ * @param options - Optional configuration (e.g. verifyClient for auth)
  * @returns A WsServer handle
  */
-export function createWsServer(httpServer: HttpServer): WsServer {
-  const wss = new WebSocketServer({ server: httpServer })
+export function createWsServer(httpServer: HttpServer, options?: WsServerOptions): WsServer {
+  const wssOptions: ConstructorParameters<typeof WebSocketServer>[0] = { server: httpServer }
+  if (options?.verifyClient) {
+    wssOptions.verifyClient = options.verifyClient as any
+  }
+  const wss = new WebSocketServer(wssOptions)
 
   const clients = new Set<WebSocket>()
   const messageCallbacks: Array<(data: string) => void> = []
+  const connectionCallbacks: Array<(socket: WebSocket, req: IncomingMessage) => void> = []
 
-  wss.on('connection', (ws: WebSocket) => {
+  wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+    // Notify connection listeners (before adding to clients set,
+    // so replay can send directly to the socket)
+    for (const cb of connectionCallbacks) {
+      cb(ws, req)
+    }
     clients.add(ws)
 
     ws.on('message', (raw: Buffer | string) => {
@@ -101,6 +121,10 @@ export function createWsServer(httpServer: HttpServer): WsServer {
       messageCallbacks.push(cb)
     },
 
+    onConnection(cb: (socket: WebSocket, req: IncomingMessage) => void): void {
+      connectionCallbacks.push(cb)
+    },
+
     clientCount(): number {
       return clients.size
     },
@@ -108,8 +132,9 @@ export function createWsServer(httpServer: HttpServer): WsServer {
     close(): void {
       // Stop accepting new connections first
       wss.close()
-      // Clear all message callbacks — no more forwarding after close
+      // Clear all callbacks — no more forwarding after close
       messageCallbacks.length = 0
+      connectionCallbacks.length = 0
       // Initiate graceful close on each client.
       // Actual removal from `clients` happens in the per-socket 'close' handler.
       for (const ws of clients) {

@@ -22,6 +22,8 @@ import { spawnClaude, SpawnError } from './spawner.js'
 import { createLineReader, writeLine } from './lineReader.js'
 import { waitForInitialize, InitializeTimeoutError } from './initializer.js'
 import { printStartupBanner } from './terminalUI.js'
+import { generateToken, createVerifyClient } from './auth.js'
+import { createMessageCache } from './messageCache.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -59,22 +61,53 @@ async function main() {
   const port = parseInt(args.port ?? '7860', 10)
 
   // -----------------------------------------------------------------------
-  // 1. Start HTTP server (serves web UI static files + health/sessions API)
+  // 1. Generate authentication token
+  // -----------------------------------------------------------------------
+  const token = generateToken()
+
+  // -----------------------------------------------------------------------
+  // 2. Start HTTP server (serves web UI static files + health/sessions API)
   // -----------------------------------------------------------------------
   const { server, url } = await startHttpServer(port)
 
   // -----------------------------------------------------------------------
-  // 2. Create WebSocket server (attaches to the HTTP server for WS upgrade)
+  // 3. Create WebSocket server with token auth
   // -----------------------------------------------------------------------
-  const ws = createWsServer(server)
+  const ws = createWsServer(server, {
+    verifyClient: createVerifyClient(token),
+  })
 
   // -----------------------------------------------------------------------
-  // 3. Print terminal UI banner
+  // 4. Create message cache for reconnect replay
   // -----------------------------------------------------------------------
-  printStartupBanner(url, port)
+  const cache = createMessageCache(200)
+  let seq = 0
+
+  // On new connection, check ?last_seq query param and replay cached messages
+  ws.onConnection((socket, req) => {
+    const urlObj = new URL(req.url ?? '/', 'http://localhost')
+    const lastSeqParam = urlObj.searchParams.get('last_seq')
+    if (lastSeqParam !== null) {
+      const lastSeq = parseInt(lastSeqParam, 10)
+      if (!Number.isNaN(lastSeq)) {
+        const missed = cache.replay(lastSeq)
+        for (const msg of missed) {
+          socket.send(msg)
+        }
+        if (missed.length > 0) {
+          console.log(`   Replay: ${missed.length} cached messages from seq ${lastSeq + 1}`)
+        }
+      }
+    }
+  })
 
   // -----------------------------------------------------------------------
-  // 4. Spawn claude process
+  // 5. Print terminal UI banner (with token in URLs)
+  // -----------------------------------------------------------------------
+  printStartupBanner(url, port, token)
+
+  // -----------------------------------------------------------------------
+  // 6. Spawn claude process
   // -----------------------------------------------------------------------
   let claude
   try {
@@ -95,13 +128,13 @@ async function main() {
   }
 
   // -----------------------------------------------------------------------
-  // 5. Create line reader for claude stdout
+  // 7. Create line reader for claude stdout
   // -----------------------------------------------------------------------
   const reader = createLineReader(claude.stdout)
   const iterator = reader[Symbol.asyncIterator]()
 
   // -----------------------------------------------------------------------
-  // 6. Initialize handshake — must complete before we start bridging
+  // 8. Initialize handshake — must complete before we start bridging
   // -----------------------------------------------------------------------
   try {
     await waitForInitialize(
@@ -126,9 +159,9 @@ async function main() {
   console.log('   Claude process ready (initialize handshake complete)')
 
   // -----------------------------------------------------------------------
-  // 7. Bidirectional bridge
+  // 9. Bidirectional bridge
   //    WS client message  →  write to claude stdin
-  //    claude stdout line  →  broadcast to all WS clients
+  //    claude stdout line  →  cache + broadcast to all WS clients
   // -----------------------------------------------------------------------
 
   // Client → claude
@@ -141,13 +174,15 @@ async function main() {
     }
   })
 
-  // claude → all clients (continuous read loop)
+  // claude → cache + broadcast to all clients (continuous read loop)
   ;(async () => {
     try {
       for (;;) {
         const { value, done } = await iterator.next()
         if (done) break
-        // value is a raw JSON string line — broadcast as-is
+        // Assign sequence number, cache, then broadcast
+        seq++
+        cache.push(value, seq)
         ws.broadcast(value)
       }
     } catch (err) {
@@ -156,7 +191,7 @@ async function main() {
   })()
 
   // -----------------------------------------------------------------------
-  // 8. Claude process exit handler
+  // 10. Claude process exit handler
   // -----------------------------------------------------------------------
   claude.on('exit', (code) => {
     console.log(`\n   Claude process exited with code ${code ?? 0}`)
