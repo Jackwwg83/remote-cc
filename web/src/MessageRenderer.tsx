@@ -1,10 +1,12 @@
-// T-11/T-15/T-16/T-17/T-18: Message renderer for remote-cc web UI
+// T-11/T-15/T-16/T-17/T-18/T-22/T-23: Message renderer for remote-cc web UI
 
 import { useState, useMemo, useCallback } from 'react'
 import { marked } from 'marked'
 import hljs from 'highlight.js'
 import DOMPurify from 'dompurify'
 import 'highlight.js/styles/github-dark.min.css'
+import FileViewer from './FileViewer'
+import DiffViewer from './DiffViewer'
 
 // Configure marked with highlight.js for code blocks
 marked.setOptions({
@@ -88,7 +90,19 @@ function ToolUseBlock({ name, input }: { name: string; input: unknown }) {
 const COLLAPSED_LINES = 5
 const MAX_DISPLAY_LINES = 500
 
-function ToolResultBlock({ content, toolName }: { content: unknown; toolName?: string }) {
+// T-22/T-23: Tool name sets for routing results to specialized viewers
+const FILE_READ_TOOLS = new Set(['read', 'fileread', 'write', 'filewrite', 'glob', 'globtool', 'grep', 'greptool'])
+const FILE_EDIT_TOOLS = new Set(['edit', 'fileedit'])
+
+/** Extract the file_path from tool_use input for file-related tools */
+function extractFilePath(input: unknown): string | undefined {
+  if (!input || typeof input !== 'object') return undefined
+  const params = input as Record<string, unknown>
+  const path = params.file_path ?? params.path ?? params.filePath ?? params.filename
+  return typeof path === 'string' ? path : undefined
+}
+
+function ToolResultBlock({ content, toolName, toolInput }: { content: unknown; toolName?: string; toolInput?: unknown }) {
   const text = useMemo(() => {
     if (typeof content === 'string') return content
     if (Array.isArray(content)) {
@@ -109,6 +123,20 @@ function ToolResultBlock({ content, toolName }: { content: unknown; toolName?: s
   // Delegate to BashResultBlock for Bash tool results
   if (toolName && (toolName === 'Bash' || toolName === 'bash' || toolName.toLowerCase().includes('bash'))) {
     return <BashResultBlock text={text} />
+  }
+
+  // T-23: FileEdit → DiffViewer
+  if (toolName && FILE_EDIT_TOOLS.has(toolName.toLowerCase())) {
+    const filePath = extractFilePath(toolInput)
+    return <DiffViewer content={text} filePath={filePath} />
+  }
+
+  // T-22: FileRead/Glob/Grep → FileViewer (only when we have a file path)
+  if (toolName && FILE_READ_TOOLS.has(toolName.toLowerCase())) {
+    const filePath = extractFilePath(toolInput)
+    if (filePath) {
+      return <FileViewer content={text} filePath={filePath} />
+    }
   }
 
   return <CollapsibleOutput text={text} />
@@ -461,13 +489,15 @@ function AssistantContent({ content }: { content: unknown }) {
     return <pre className="text-xs text-gray-500">{JSON.stringify(content, null, 2)}</pre>
   }
 
-  // Build a map of tool_use id -> name for tool_result rendering
+  // Build maps of tool_use id -> name and id -> input for tool_result rendering
   const toolNameMap = new Map<string, string>()
+  const toolInputMap = new Map<string, unknown>()
   for (const block of content) {
     if (block && typeof block === 'object' && 'type' in block) {
       const b = block as Record<string, unknown>
       if (b.type === 'tool_use' && typeof b.id === 'string' && typeof b.name === 'string') {
         toolNameMap.set(b.id, b.name)
+        toolInputMap.set(b.id, b.input)
       }
     }
   }
@@ -497,7 +527,8 @@ function AssistantContent({ content }: { content: unknown }) {
           case 'tool_result': {
             const toolId = b.tool_use_id as string | undefined
             const toolName = toolId ? toolNameMap.get(toolId) : undefined
-            return <ToolResultBlock key={i} content={b.content} toolName={toolName} />
+            const toolInput = toolId ? toolInputMap.get(toolId) : undefined
+            return <ToolResultBlock key={i} content={b.content} toolName={toolName} toolInput={toolInput} />
           }
           default:
             return (
