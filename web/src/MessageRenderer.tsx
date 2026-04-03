@@ -133,6 +133,8 @@ export interface ChatMessage {
     role?: string
     content?: unknown
   }
+  /** Marker for streaming-in-progress messages (set by App.tsx) */
+  _streaming?: boolean
   [key: string]: unknown
 }
 
@@ -143,6 +145,9 @@ export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
         <div className="flex justify-start mb-4">
           <div className="max-w-[85%] md:max-w-[75%]">
             <AssistantContent content={msg.message?.content} />
+            {msg._streaming && (
+              <span className="inline-block w-2 h-4 bg-blue-400 animate-pulse rounded-sm ml-0.5 align-text-bottom" />
+            )}
           </div>
         </div>
       )

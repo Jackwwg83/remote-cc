@@ -1,8 +1,9 @@
-// T-10: Chat interface for remote-cc web UI
+// T-10/T-13/T-14: Chat interface with streaming support for remote-cc web UI
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { connectWs } from './ws'
 import MessageRenderer, { type ChatMessage } from './MessageRenderer'
+import { createStreamingState, streamingToContent, type StreamingMessage } from './streamingState'
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
@@ -12,36 +13,115 @@ function getWsUrl(): string {
 export default function App() {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected')
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [streamingMsg, setStreamingMsg] = useState<StreamingMessage | null>(null)
   const [input, setInput] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<ReturnType<typeof connectWs> | null>(null)
+  const streamStateRef = useRef(createStreamingState())
 
-  // Auto-scroll to bottom on new messages
+  // T-14: rAF throttling refs — survive re-renders without triggering them
+  const pendingUpdateRef = useRef<StreamingMessage | null>(null)
+  const rafIdRef = useRef<number | null>(null)
+
+  const scheduleRender = useCallback((msg: StreamingMessage) => {
+    pendingUpdateRef.current = msg
+    if (!rafIdRef.current) {
+      rafIdRef.current = requestAnimationFrame(() => {
+        if (pendingUpdateRef.current) {
+          setStreamingMsg(pendingUpdateRef.current)
+        }
+        rafIdRef.current = null
+      })
+    }
+  }, [])
+
+  // Auto-scroll to bottom on new messages or streaming updates
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, streamingMsg])
 
   // Connect WebSocket on mount
   useEffect(() => {
     const ws = connectWs(getWsUrl())
     wsRef.current = ws
+    const ss = streamStateRef.current
 
     ws.onStateChange(setStatus)
 
     ws.onMessage((data) => {
-      if (data && typeof data === 'object' && 'type' in (data as Record<string, unknown>)) {
-        const msg = data as ChatMessage
-        // Fix 2: Only display chat messages, skip keep_alive/control signals
-        const chatTypes = new Set(['assistant', 'system', 'result'])
-        if (!chatTypes.has(msg.type)) return
-        // Fix 3: Skip incoming 'user' messages — we already echo them locally
-        // (handles --replay-user-messages duplication)
-        setMessages((prev) => [...prev, msg])
+      if (!data || typeof data !== 'object' || !('type' in (data as Record<string, unknown>))) return
+
+      const d = data as Record<string, unknown>
+
+      // T-13: Route partial messages through streaming state machine
+      if (d.type === 'assistant' && d.subtype === 'partial') {
+        const event = d.event as Record<string, unknown> | undefined
+
+        // message_stop: finalize streaming → move to regular messages
+        if (event?.type === 'message_stop') {
+          ss.handlePartial(data)
+          const final = ss.finalize()
+          if (final) {
+            // Flush any pending rAF
+            if (rafIdRef.current) {
+              cancelAnimationFrame(rafIdRef.current)
+              rafIdRef.current = null
+            }
+            pendingUpdateRef.current = null
+            setStreamingMsg(null)
+
+            // Convert to ChatMessage format and add to messages
+            const chatMsg: ChatMessage = {
+              type: 'assistant',
+              message: {
+                role: 'assistant',
+                content: streamingToContent(final),
+              },
+            }
+            setMessages((prev) => [...prev, chatMsg])
+          }
+          return
+        }
+
+        // Other partial events: update streaming state, throttle render
+        const updated = ss.handlePartial(data)
+        if (updated) {
+          scheduleRender(updated)
+        }
+        return
+      }
+
+      // Complete assistant message: replace any streaming state
+      if (d.type === 'assistant' && d.subtype !== 'partial') {
+        // Cancel streaming if active
+        ss.reset()
+        if (rafIdRef.current) {
+          cancelAnimationFrame(rafIdRef.current)
+          rafIdRef.current = null
+        }
+        pendingUpdateRef.current = null
+        setStreamingMsg(null)
+
+        setMessages((prev) => [...prev, data as ChatMessage])
+        return
+      }
+
+      // Other chat message types
+      const chatTypes = new Set(['system', 'result'])
+      if (chatTypes.has(d.type as string)) {
+        setMessages((prev) => [...prev, data as ChatMessage])
       }
     })
 
-    return () => ws.close()
-  }, [])
+    return () => {
+      ws.close()
+      // Clean up rAF on unmount
+      if (rafIdRef.current) {
+        cancelAnimationFrame(rafIdRef.current)
+        rafIdRef.current = null
+      }
+    }
+  }, [scheduleRender])
 
   const sendMessage = useCallback(() => {
     const text = input.trim()
@@ -69,6 +149,18 @@ export default function App() {
     }
   }
 
+  // Build the streaming ChatMessage to display at the bottom
+  const streamingChatMsg: ChatMessage | null = streamingMsg
+    ? {
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: streamingToContent(streamingMsg),
+        },
+        _streaming: true,
+      }
+    : null
+
   const statusColor = status === 'connected' ? 'bg-green-400'
     : status === 'connecting' ? 'bg-yellow-400 animate-pulse'
     : 'bg-red-400'
@@ -88,12 +180,15 @@ export default function App() {
 
       {/* Messages */}
       <main className="flex-1 overflow-y-auto p-4">
-        {messages.length === 0 && (
+        {messages.length === 0 && !streamingChatMsg && (
           <p className="text-gray-500 text-center mt-20">Send a message to get started</p>
         )}
         {messages.map((msg, i) => (
           <MessageRenderer key={i} msg={msg} />
         ))}
+        {streamingChatMsg && (
+          <MessageRenderer msg={streamingChatMsg} />
+        )}
         <div ref={bottomRef} />
       </main>
 
