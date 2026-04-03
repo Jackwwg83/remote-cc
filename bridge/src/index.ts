@@ -152,18 +152,22 @@ async function main() {
   // 8. Initialize handshake — must complete before we start bridging
   // -----------------------------------------------------------------------
   try {
-    await waitForInitialize(
+    const initResult = await waitForInitialize(
       iterator,
-      (obj) => writeLine(claude.stdin, obj),
+      (obj) => writeLine(claude.stdin, obj),  // for SDK mode control_response
     )
-    // preInitMessages are intentionally not broadcast to clients —
-    // they arrive before any client is connected.
+    console.log(`✅ Claude is ready (${initResult.mode})`)
+    // Cache early messages so they can be replayed to clients that connect later
+    for (const msg of initResult.earlyMessages) {
+      seq++
+      cache.push(msg, seq)
+    }
   } catch (err) {
     if (err instanceof InitializeTimeoutError) {
-      console.error('\nClaude did not send initialize request within timeout.')
-      console.error('The claude process may have crashed or is not responding.\n')
+      console.error('\n❌ Claude did not produce any output within timeout.')
+      console.error('Is claude installed? Try: claude --version\n')
     } else {
-      console.error('\nInitialize handshake failed:', err)
+      console.error('\n❌ Claude startup failed:', err)
     }
     claude.kill()
     ws.close()

@@ -1,12 +1,12 @@
 /**
- * initializer.ts — Wait for claude's init message before bridging.
+ * initializer.ts — Wait for claude to be ready before bridging.
  *
- * When claude starts in `--print --output-format stream-json` mode, its
- * first stdout message is `{"type":"system","subtype":"init",...}` containing
- * session config (tools, model, session_id, etc.).
+ * Protocol-aware init detection: handles three startup modes:
+ * 1. SDK mode: control_request (initialize) → reply control_response
+ * 2. Bare mode: system.init message → ready
+ * 3. Normal mode: hook_started/hook_response → liveness fallback → ready
  *
- * The bridge waits for this message to confirm claude is ready, then starts
- * the bidirectional message bridge. No response to stdin is needed.
+ * Does NOT add --bare to spawn (preserves normal hook/config path).
  */
 
 // ---------------------------------------------------------------------------
@@ -14,15 +14,15 @@
 // ---------------------------------------------------------------------------
 
 export interface InitResult {
-  /** The parsed init message from claude. */
-  initMessage: Record<string, unknown>
-  /** Any raw JSON lines that arrived before the init message (e.g., hook events). */
-  preInitMessages: string[]
+  /** How claude was detected as ready. */
+  mode: 'sdk-initialize' | 'system-init' | 'hook-liveness' | 'any-output'
+  /** All messages collected during init wait (forwarded to clients). */
+  earlyMessages: string[]
 }
 
 export class InitializeTimeoutError extends Error {
   constructor(timeoutMs: number) {
-    super(`Timed out waiting for claude init message after ${timeoutMs}ms`)
+    super(`Timed out waiting for claude output after ${timeoutMs}ms — is claude installed and configured?`)
     this.name = 'InitializeTimeoutError'
   }
 }
@@ -31,31 +31,28 @@ export class InitializeTimeoutError extends Error {
 // Constants
 // ---------------------------------------------------------------------------
 
-export const INITIALIZE_TIMEOUT_MS = 15_000
+export const INITIALIZE_TIMEOUT_MS = 30_000
+
+/** Message types that indicate claude is alive and processing. */
+const LIVENESS_TYPES = new Set([
+  'hook_started', 'hook_response', 'hook_progress',  // hook lifecycle
+])
 
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
 /**
- * Wait for claude's `system.init` message.
+ * Wait for claude to signal readiness via any supported init protocol.
  *
- * Uses the iterator's `.next()` method directly (instead of `for-await`)
- * so the async generator from `createLineReader` is NOT closed on return.
- * This allows the caller to continue reading post-init messages from the
- * same iterator.
- *
- * @param iterator - An AsyncIterator of raw JSON lines
- * @param timeoutMs - Timeout in ms (default: 15000)
- * @returns The init message and any pre-init messages
- * @throws InitializeTimeoutError if no init message within timeout
+ * Uses iterator.next() directly to avoid closing the async generator.
  */
 export async function waitForInitialize(
   iterator: AsyncIterator<string>,
-  _writeToStdin?: (obj: unknown) => void, // kept for API compat, not used
+  writeToStdin?: (obj: unknown) => void,
   timeoutMs: number = INITIALIZE_TIMEOUT_MS,
 ): Promise<InitResult> {
-  const preInitMessages: string[] = []
+  const earlyMessages: string[] = []
 
   return new Promise<InitResult>((resolve, reject) => {
     let settled = false
@@ -67,56 +64,56 @@ export async function waitForInitialize(
       }
     }, timeoutMs)
 
+    const done = (mode: InitResult['mode']) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ mode, earlyMessages })
+    }
+
+    const fail = (err: unknown) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(err)
+    }
+
     const iterate = async () => {
       try {
         for (;;) {
           const result = await iterator.next()
 
           if (result.done) {
-            if (!settled) {
-              settled = true
-              clearTimeout(timer)
-              reject(new Error('Stream ended before init message was received'))
-            }
+            fail(new Error('Claude process exited before producing any output'))
             return
           }
 
           if (settled) return
 
           const line = result.value
-
           if (!line.trim()) continue
+
+          earlyMessages.push(line)
 
           let msg: Record<string, unknown>
           try {
             msg = JSON.parse(line) as Record<string, unknown>
           } catch {
-            // Malformed JSON — skip
-            continue
-          }
-
-          // Claude sends {"type":"system","subtype":"init",...} as its first message
-          if (msg.type === 'system' && msg.subtype === 'init') {
-            settled = true
-            clearTimeout(timer)
-            resolve({
-              initMessage: msg,
-              preInitMessages,
-            })
+            // Non-JSON output — still means claude is alive
+            done('any-output')
             return
           }
 
-          // Also accept control_request initialize (SDK mode, for forward compat)
+          // Mode 1: SDK — control_request (initialize)
           if (
             msg.type === 'control_request' &&
             typeof msg.request === 'object' &&
             msg.request !== null &&
             (msg.request as Record<string, unknown>).subtype === 'initialize'
           ) {
-            // In SDK mode, we need to respond
-            if (_writeToStdin) {
-              const requestId = (msg as Record<string, unknown>).request_id as string
-              _writeToStdin({
+            if (writeToStdin) {
+              const requestId = msg.request_id as string
+              writeToStdin({
                 type: 'control_response',
                 response: {
                   subtype: 'success',
@@ -133,24 +130,34 @@ export async function waitForInitialize(
                 },
               })
             }
-            settled = true
-            clearTimeout(timer)
-            resolve({
-              initMessage: msg,
-              preInitMessages,
-            })
+            done('sdk-initialize')
             return
           }
 
-          // Pre-init messages (hook events, etc.) — collect but don't drop
-          preInitMessages.push(line)
+          // Mode 2: Bare — system.init
+          if (msg.type === 'system' && msg.subtype === 'init') {
+            done('system-init')
+            return
+          }
+
+          // Mode 3: Normal — hook lifecycle events = liveness
+          if (
+            msg.type === 'system' &&
+            typeof msg.subtype === 'string' &&
+            LIVENESS_TYPES.has(msg.subtype)
+          ) {
+            done('hook-liveness')
+            return
+          }
+
+          // Any other valid JSON message — also means claude is alive
+          if (typeof msg.type === 'string') {
+            done('any-output')
+            return
+          }
         }
       } catch (err) {
-        if (!settled) {
-          settled = true
-          clearTimeout(timer)
-          reject(err)
-        }
+        fail(err)
       }
     }
 
