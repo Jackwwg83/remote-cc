@@ -197,7 +197,8 @@ export function startHttpServer(port: number): Promise<{ server: HttpServer; url
 
     server.on('error', reject)
 
-    server.listen(port, '0.0.0.0', () => {
+    const host = process.env.REMOTE_CC_HOST ?? '0.0.0.0'
+    server.listen(port, host, () => {
       const addr = server.address()
       let resolvedHost = '0.0.0.0'
       let resolvedPort = port
