@@ -270,6 +270,20 @@ export default function App() {
         <span className="ml-auto text-xs text-gray-500">remote-cc v0.1.0</span>
       </header>
 
+      {/* T-34: Reconnecting banner */}
+      {status === 'reconnecting' && (
+        <div className="px-4 py-2 bg-yellow-900/80 text-yellow-200 text-sm text-center shrink-0">
+          Connection lost. Reconnecting{reconnectInfo ? ` (${reconnectInfo.attempt}/${reconnectInfo.maxAttempts})` : ''}...
+        </div>
+      )}
+
+      {/* T-34: Reconnected banner — auto-dismisses after 3s */}
+      {showReconnected && status === 'connected' && (
+        <div className="px-4 py-2 bg-green-900/80 text-green-200 text-sm text-center shrink-0">
+          Reconnected
+        </div>
+      )}
+
       {/* Messages */}
       <main className="flex-1 overflow-y-auto p-4">
         {messages.length === 0 && !streamingChatMsg && (

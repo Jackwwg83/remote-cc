@@ -24,6 +24,7 @@ import { waitForInitialize, InitializeTimeoutError } from './initializer.js'
 import { printStartupBanner } from './terminalUI.js'
 import { generateToken, createVerifyClient } from './auth.js'
 import { createMessageCache } from './messageCache.js'
+import { detectTailscale } from './tailscale.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -104,9 +105,10 @@ async function main() {
   })
 
   // -----------------------------------------------------------------------
-  // 5. Print terminal UI banner (with token in URLs)
+  // 5. Detect Tailscale + print terminal UI banner (with token in URLs)
   // -----------------------------------------------------------------------
-  printStartupBanner(url, port, token)
+  const tailscale = await detectTailscale()
+  await printStartupBanner(url, port, token, tailscale)
 
   // -----------------------------------------------------------------------
   // 6. Spawn claude process

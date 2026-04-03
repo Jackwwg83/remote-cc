@@ -1,11 +1,11 @@
 /**
- * Terminal UI — startup banner, connection status, local IP detection
- *
- * QR code display is deferred to T-31.
+ * Terminal UI — startup banner, connection status, local IP detection, QR code
  */
 
 import chalk from 'chalk'
 import { networkInterfaces } from 'node:os'
+import QRCode from 'qrcode'
+import type { TailscaleStatus } from './tailscale.js'
 
 const VERSION = '0.1.0'
 
@@ -57,33 +57,64 @@ export function detectNetworkAddresses(): NetworkAddresses {
 }
 
 // ---------------------------------------------------------------------------
+// QR code helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a small terminal-friendly QR code string for the given URL.
+ * Returns null if generation fails (non-fatal).
+ */
+export async function generateQR(url: string): Promise<string | null> {
+  try {
+    const qr = await QRCode.toString(url, {
+      type: 'terminal',
+      small: true,
+      errorCorrectionLevel: 'L',
+    })
+    return qr
+  } catch {
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
- * Print the startup banner.
+ * Print the startup banner with URLs, Tailscale status, and QR code.
  *
  * ```
  * remote-cc v0.1.0
  *
- *    Local:      http://localhost:7860
- *    Tailscale:  http://100.64.1.5:7860
- *    LAN:        http://192.168.1.5:7860
+ *    Local:      http://localhost:7860?token=...
+ *    Tailscale:  http://100.64.1.5:7860?token=...
+ *    LAN:        http://192.168.1.5:7860?token=...
+ *
+ *    [QR code]
  *
  *    Waiting for client connection...
  * ```
  */
-export function printStartupBanner(url: string, port: number, token?: string): void {
+export async function printStartupBanner(
+  url: string,
+  port: number,
+  token?: string,
+  tailscale?: TailscaleStatus,
+): Promise<void> {
   const addrs = detectNetworkAddresses()
   const qs = token ? `?token=${token}` : ''
+
+  // Prefer Tailscale CLI IP over network-interface detection
+  const tailscaleIp = tailscale?.ip ?? addrs.tailscale
 
   console.log()
   console.log(chalk.bold.cyan(`  remote-cc`) + chalk.dim(` v${VERSION}`))
   console.log()
   console.log(`   ${chalk.dim('Local:')}      ${chalk.green(`http://localhost:${port}${qs}`)}`)
-  if (addrs.tailscale) {
+  if (tailscaleIp) {
     console.log(
-      `   ${chalk.dim('Tailscale:')}  ${chalk.green(`http://${addrs.tailscale}:${port}${qs}`)}`,
+      `   ${chalk.dim('Tailscale:')}  ${chalk.green(`http://${tailscaleIp}:${port}${qs}`)}`,
     )
   }
   if (addrs.lan) {
@@ -91,10 +122,42 @@ export function printStartupBanner(url: string, port: number, token?: string): v
       `   ${chalk.dim('LAN:')}        ${chalk.green(`http://${addrs.lan}:${port}${qs}`)}`,
     )
   }
+
+  // Tailscale guidance messages
+  if (tailscale && !tailscale.installed) {
+    console.log()
+    console.log(
+      `   ${chalk.yellow('Tailscale not found.')} Install: ${chalk.underline('https://tailscale.com/download')}`,
+    )
+  } else if (tailscale && tailscale.installed && !tailscale.loggedIn) {
+    console.log()
+    console.log(
+      `   ${chalk.yellow('Tailscale installed but not connected.')} Run: ${chalk.cyan('tailscale up')}`,
+    )
+  }
+
   if (token) {
     console.log()
     console.log(`   ${chalk.dim('Token:')}      ${chalk.yellow(token)}`)
   }
+
+  // QR code — use best available URL
+  const bestUrl = tailscaleIp
+    ? `http://${tailscaleIp}:${port}${qs}`
+    : addrs.lan
+      ? `http://${addrs.lan}:${port}${qs}`
+      : `http://localhost:${port}${qs}`
+
+  const qr = await generateQR(bestUrl)
+  if (qr) {
+    console.log()
+    console.log(`   ${chalk.dim('Scan to connect:')}`)
+    // Indent each QR line for alignment
+    for (const line of qr.split('\n')) {
+      if (line) console.log(`   ${line}`)
+    }
+  }
+
   console.log()
   console.log(`   ${chalk.yellow('Waiting for client connection...')}`)
   console.log()
