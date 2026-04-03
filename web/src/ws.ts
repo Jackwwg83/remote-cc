@@ -1,10 +1,16 @@
-// T-09: WebSocket client for remote-cc web UI
-// Supports seq envelope unwrapping and last_seq reconnect replay.
+// T-09/T-32/T-33: WebSocket client for remote-cc web UI
+// Supports seq envelope unwrapping, last_seq reconnect replay, and auto-reconnect.
 
-type WsState = 'connecting' | 'connected' | 'disconnected'
+export type WsState = 'connecting' | 'connected' | 'reconnecting' | 'disconnected'
 type MessageCallback = (data: unknown) => void
-type StateCallback = (state: WsState) => void
+type StateCallback = (state: WsState, meta?: ReconnectMeta) => void
 type ErrorCallback = (err: Event) => void
+
+/** Metadata passed with 'reconnecting' state changes */
+export interface ReconnectMeta {
+  attempt: number
+  maxAttempts: number
+}
 
 /** Seq envelope sent by the bridge: {"seq": N, "data": "<original JSON>"} */
 interface SeqEnvelope {
@@ -23,6 +29,16 @@ function isSeqEnvelope(obj: unknown): obj is SeqEnvelope {
   )
 }
 
+// T-32: Reconnect constants (matches reference: RECONNECT_DELAY_MS=2000, MAX_RECONNECT_ATTEMPTS=5)
+const RECONNECT_DELAY_MS = 2000
+const MAX_RECONNECT_ATTEMPTS = 5
+
+/** Close codes that should NOT trigger reconnect */
+const NO_RECONNECT_CODES = new Set([
+  1000, // normal close
+  4003, // unauthorized
+])
+
 export function connectWs(baseUrl: string) {
   const messageCallbacks: MessageCallback[] = []
   const stateCallbacks: StateCallback[] = []
@@ -31,17 +47,50 @@ export function connectWs(baseUrl: string) {
   let lastSeq = 0
   let intentionalClose = false
 
-  function notify(state: WsState) {
+  // T-32: Reconnect state
+  let reconnectAttempts = 0
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let wasConnected = false  // track if we ever established a connection
+
+  function notify(state: WsState, meta?: ReconnectMeta) {
     for (const cb of stateCallbacks) {
-      try { cb(state) } catch { /* swallow listener errors */ }
+      try { cb(state, meta) } catch { /* swallow listener errors */ }
     }
   }
 
-  /** Build the WS URL, appending last_seq for reconnect replay. */
+  /** Build the WS URL, appending last_seq for reconnect replay (T-33). */
   function buildUrl(): string {
     if (lastSeq === 0) return baseUrl
     const sep = baseUrl.includes('?') ? '&' : '?'
     return `${baseUrl}${sep}last_seq=${lastSeq}`
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+  }
+
+  /** T-32: Schedule a reconnect with exponential backoff: 2s, 4s, 8s, 16s, 32s */
+  function scheduleReconnect() {
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      notify('disconnected')
+      return
+    }
+
+    reconnectAttempts++
+    const delay = RECONNECT_DELAY_MS * Math.pow(2, reconnectAttempts - 1)
+
+    notify('reconnecting', {
+      attempt: reconnectAttempts,
+      maxAttempts: MAX_RECONNECT_ATTEMPTS,
+    })
+
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      open()
+    }, delay)
   }
 
   function open() {
@@ -49,11 +98,45 @@ export function connectWs(baseUrl: string) {
     notify('connecting')
     ws = new WebSocket(buildUrl())
 
-    ws.onopen = () => notify('connected')
+    ws.onopen = () => {
+      // T-32: Reset backoff on successful connection
+      const wasReconnect = reconnectAttempts > 0
+      reconnectAttempts = 0
+      wasConnected = true
+      notify('connected')
 
-    ws.onclose = () => {
+      // If this was a reconnect, the bridge will replay missed messages via last_seq (T-33).
+      // The caller can detect this via the wasReconnect info if needed.
+      if (wasReconnect && lastSeq > 0) {
+        // Replay is handled by the bridge — messages will arrive via onmessage.
+        // Duplicates are skipped because the bridge only sends seq > last_seq.
+      }
+    }
+
+    ws.onclose = (ev: CloseEvent) => {
       ws = null
-      notify('disconnected')
+      const code = ev.code
+
+      // Don't reconnect on intentional close
+      if (intentionalClose) {
+        notify('disconnected')
+        return
+      }
+
+      // T-32: Don't reconnect on permanent close codes (4003 unauthorized, 1000 normal)
+      if (NO_RECONNECT_CODES.has(code)) {
+        notify('disconnected')
+        return
+      }
+
+      // T-32: Auto-reconnect with backoff if we were previously connected
+      // or if the initial connection failed (network error)
+      if (wasConnected || reconnectAttempts > 0) {
+        scheduleReconnect()
+      } else {
+        // First connection failed — still try to reconnect
+        scheduleReconnect()
+      }
     }
 
     ws.onerror = (ev: Event) => {
@@ -61,8 +144,7 @@ export function connectWs(baseUrl: string) {
       for (const cb of errorCallbacks) {
         try { cb(ev) } catch { /* swallow listener errors */ }
       }
-      // onerror always fires before onclose; onclose handles state
-      notify('disconnected')
+      // onerror always fires before onclose; onclose handles state + reconnect
     }
 
     ws.onmessage = (ev: MessageEvent) => {
@@ -94,6 +176,20 @@ export function connectWs(baseUrl: string) {
     }
   }
 
+  // T-32: Listen to navigator.onLine — trigger reconnect when back online
+  function handleOnline() {
+    // If we're disconnected or reconnecting, try immediately
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      clearReconnectTimer()
+      reconnectAttempts = 0  // reset backoff since network just came back
+      open()
+    }
+  }
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('online', handleOnline)
+  }
+
   open()
 
   return {
@@ -118,7 +214,19 @@ export function connectWs(baseUrl: string) {
         const s = ws.readyState
         if (s === WebSocket.CONNECTING) cb('connecting')
         else if (s === WebSocket.OPEN) cb('connected')
-        else cb('disconnected')
+        else if (reconnectAttempts > 0) {
+          cb('reconnecting', {
+            attempt: reconnectAttempts,
+            maxAttempts: MAX_RECONNECT_ATTEMPTS,
+          })
+        } else {
+          cb('disconnected')
+        }
+      } else if (reconnectAttempts > 0) {
+        cb('reconnecting', {
+          attempt: reconnectAttempts,
+          maxAttempts: MAX_RECONNECT_ATTEMPTS,
+        })
       } else {
         cb('disconnected')
       }
@@ -126,6 +234,8 @@ export function connectWs(baseUrl: string) {
 
     /** Reconnect with last_seq for replay of missed messages. */
     reconnect() {
+      clearReconnectTimer()
+      reconnectAttempts = 0
       if (ws) {
         ws.onclose = null
         ws.close()
@@ -136,6 +246,10 @@ export function connectWs(baseUrl: string) {
 
     close() {
       intentionalClose = true
+      clearReconnectTimer()
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', handleOnline)
+      }
       if (ws) {
         ws.onclose = null  // prevent state notification on intentional close
         ws.close()

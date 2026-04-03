@@ -1,10 +1,12 @@
-// T-10/T-13/T-14/T-19-21: Chat interface with streaming + permission approval for remote-cc web UI
+// T-10/T-13/T-14/T-19-21/T-32-34: Chat interface with streaming, permission approval, reconnect for remote-cc web UI
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { connectWs } from './ws'
+import { connectWs, type WsState, type ReconnectMeta } from './ws'
 import MessageRenderer, { type ChatMessage } from './MessageRenderer'
 import { createStreamingState, streamingToContent, type StreamingMessage } from './streamingState'
 import PermissionDialog, { type PermissionRequest, type PermissionAction } from './PermissionDialog'
+import InstallPrompt from './InstallPrompt'
+import QuickCommands from './QuickCommands'
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
@@ -20,7 +22,14 @@ function getWsUrl(): string {
 }
 
 export default function App() {
-  const [status, setStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected')
+  const [status, setStatus] = useState<WsState>('disconnected')
+  // T-34: Track reconnect attempt for UI display
+  const [reconnectInfo, setReconnectInfo] = useState<ReconnectMeta | null>(null)
+  // T-34: "Reconnected" banner that auto-dismisses after 3s
+  const [showReconnected, setShowReconnected] = useState(false)
+  const reconnectedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const prevStatusRef = useRef<WsState>('disconnected')
+
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [streamingMsg, setStreamingMsg] = useState<StreamingMessage | null>(null)
   const [input, setInput] = useState('')
@@ -57,7 +66,27 @@ export default function App() {
     wsRef.current = ws
     const ss = streamStateRef.current
 
-    ws.onStateChange(setStatus)
+    // T-34: Handle state changes with reconnect metadata
+    ws.onStateChange((state: WsState, meta?: ReconnectMeta) => {
+      const prev = prevStatusRef.current
+      prevStatusRef.current = state
+
+      setStatus(state)
+      setReconnectInfo(state === 'reconnecting' && meta ? meta : null)
+
+      // T-34: Show "Reconnected" banner when transitioning from reconnecting to connected
+      if (state === 'connected' && (prev === 'reconnecting' || prev === 'connecting')) {
+        // Only show if we were actually reconnecting (not initial connect)
+        if (prev === 'reconnecting') {
+          setShowReconnected(true)
+          if (reconnectedTimerRef.current) clearTimeout(reconnectedTimerRef.current)
+          reconnectedTimerRef.current = setTimeout(() => {
+            setShowReconnected(false)
+            reconnectedTimerRef.current = null
+          }, 3000)
+        }
+      }
+    })
 
     ws.onMessage((data) => {
       if (!data || typeof data !== 'object' || !('type' in (data as Record<string, unknown>))) return
@@ -144,6 +173,11 @@ export default function App() {
         cancelAnimationFrame(rafIdRef.current)
         rafIdRef.current = null
       }
+      // Clean up reconnected banner timer
+      if (reconnectedTimerRef.current) {
+        clearTimeout(reconnectedTimerRef.current)
+        reconnectedTimerRef.current = null
+      }
     }
   }, [scheduleRender])
 
@@ -216,11 +250,15 @@ export default function App() {
       }
     : null
 
+  // T-34: Connection status indicator colors and labels
   const statusColor = status === 'connected' ? 'bg-green-400'
+    : status === 'reconnecting' ? 'bg-yellow-400 animate-pulse'
     : status === 'connecting' ? 'bg-yellow-400 animate-pulse'
     : 'bg-red-400'
 
   const statusLabel = status === 'connected' ? 'Connected'
+    : status === 'reconnecting' && reconnectInfo
+      ? `Reconnecting (${reconnectInfo.attempt}/${reconnectInfo.maxAttempts})`
     : status === 'connecting' ? 'Connecting...'
     : 'Disconnected'
 
@@ -233,8 +271,22 @@ export default function App() {
         <span className="ml-auto text-xs text-gray-500">remote-cc v0.1.0</span>
       </header>
 
+      {/* T-34: Reconnecting banner */}
+      {status === 'reconnecting' && (
+        <div className="px-4 py-2 bg-yellow-900/80 text-yellow-200 text-sm text-center shrink-0">
+          Connection lost. Reconnecting{reconnectInfo ? ` (${reconnectInfo.attempt}/${reconnectInfo.maxAttempts})` : ''}...
+        </div>
+      )}
+
+      {/* T-34: Reconnected banner — auto-dismisses after 3s */}
+      {showReconnected && status === 'connected' && (
+        <div className="px-4 py-2 bg-green-900/80 text-green-200 text-sm text-center shrink-0">
+          Reconnected
+        </div>
+      )}
+
       {/* Messages */}
-      <main className="flex-1 overflow-y-auto p-4">
+      <main className="flex-1 overflow-y-auto px-2 py-4 sm:px-4">
         {messages.length === 0 && !streamingChatMsg && (
           <p className="text-gray-500 text-center mt-20">Send a message to get started</p>
         )}
@@ -248,7 +300,21 @@ export default function App() {
       </main>
 
       {/* Input */}
-      <footer className="p-4 border-t border-gray-700 shrink-0">
+      <footer className="px-2 py-2 sm:px-4 sm:py-4 border-t border-gray-700 shrink-0 pb-[env(safe-area-inset-bottom,8px)]">
+        {/* T-36: Quick command panel — mobile only */}
+        <QuickCommands
+          onCommand={(cmd) => {
+            if (!wsRef.current || status !== 'connected') return
+            const msg: ChatMessage = {
+              type: 'user',
+              message: { role: 'user', content: cmd },
+              parent_tool_use_id: null,
+              session_id: '',
+            }
+            setMessages((prev) => [...prev, msg])
+            wsRef.current.send(msg)
+          }}
+        />
         <div className="flex gap-2">
           <input
             type="text"
@@ -258,13 +324,13 @@ export default function App() {
             placeholder={status === 'connected' ? 'Type a message...' : 'Waiting for connection...'}
             disabled={status !== 'connected'}
             className="flex-1 bg-gray-800 text-white p-3 rounded-lg outline-none
-              focus:ring-2 focus:ring-blue-500
+              focus:ring-2 focus:ring-blue-500 min-h-[44px] text-base
               disabled:opacity-50 disabled:cursor-not-allowed"
           />
           <button
             onClick={sendMessage}
             disabled={status !== 'connected' || !input.trim()}
-            className="px-4 py-3 bg-blue-600 rounded-lg font-medium text-sm
+            className="px-4 py-3 bg-blue-600 rounded-lg font-medium text-sm min-h-[44px]
               hover:bg-blue-500 transition-colors
               disabled:opacity-50 disabled:cursor-not-allowed"
           >
@@ -278,6 +344,9 @@ export default function App() {
         const first = pendingPerms.values().next().value as PermissionRequest
         return <PermissionDialog request={first} onRespond={handlePermission} />
       })()}
+
+      {/* T-28: PWA install prompt */}
+      <InstallPrompt />
     </div>
   )
 }
