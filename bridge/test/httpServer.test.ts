@@ -96,7 +96,7 @@ describe('startHttpServer', () => {
   // GET /sessions
   // -------------------------------------------------------------------------
 
-  it('should return empty array on GET /sessions', async () => {
+  it('should return empty sessions on GET /sessions (no scanSessions dep)', async () => {
     await startTest()
 
     const res = await fetch(`${fetchUrl}/sessions`)
@@ -104,7 +104,7 @@ describe('startHttpServer', () => {
     expect(res.headers.get('content-type')).toContain('application/json')
 
     const body = await res.json()
-    expect(body).toEqual([])
+    expect(body).toEqual({ sessions: [] })
   })
 
   // -------------------------------------------------------------------------
@@ -141,7 +141,7 @@ describe('startHttpServer', () => {
     const res200 = await fetch(`${fetchUrl}/health`)
     expect(res200.headers.get('access-control-allow-origin')).toBe('*')
     expect(res200.headers.get('access-control-allow-methods')).toContain('GET')
-    expect(res200.headers.get('access-control-allow-methods')).not.toContain('POST')
+    expect(res200.headers.get('access-control-allow-methods')).toContain('POST')
 
     // Check on a 404 response (use extension to avoid SPA fallback)
     const res404 = await fetch(`${fetchUrl}/nonexistent.txt`)
@@ -155,7 +155,7 @@ describe('startHttpServer', () => {
     expect(res.status).toBe(204)
     expect(res.headers.get('access-control-allow-origin')).toBe('*')
     expect(res.headers.get('access-control-allow-methods')).toContain('GET')
-    expect(res.headers.get('access-control-allow-methods')).not.toContain('POST')
+    expect(res.headers.get('access-control-allow-methods')).toContain('POST')
     expect(res.headers.get('access-control-allow-headers')).toContain('Content-Type')
   })
 

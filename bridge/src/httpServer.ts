@@ -16,6 +16,9 @@ import { createServer, type Server as HttpServer, type IncomingMessage, type Ser
 import { existsSync, readFileSync } from 'node:fs'
 import { join, extname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { ProcessManager, ProcessState } from './processManager.js'
+import type { SessionInfo } from './sessionScanner.js'
+import type { ClaudeProcess, SpawnClaudeOptions } from './spawner.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -30,9 +33,27 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url))
 const WEB_DIST_DIR = join(__dirname, '..', '..', 'web', 'dist')
 const WEB_DIST_EXISTS = existsSync(WEB_DIST_DIR)
 
+// ---------------------------------------------------------------------------
+// Dependency injection
+// ---------------------------------------------------------------------------
+
+/**
+ * Optional dependencies injected into the HTTP server.
+ * Keeps httpServer decoupled from concrete implementations for testability.
+ */
+export interface HttpServerDeps {
+  /** Scan for existing Claude sessions. Returns SessionInfo[] sorted desc. */
+  scanSessions?: () => Promise<SessionInfo[]>
+  /** Process lifecycle manager — start/stop/status */
+  processManager?: ProcessManager
+  /** Called after a process is started via POST /sessions/start.
+   *  index.ts hooks this to wire up lineReader, WS bridge, etc. */
+  onSessionStarted?: (proc: ClaudeProcess) => void
+}
+
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 }
 
@@ -123,10 +144,77 @@ function tryServeStatic(urlPath: string, res: ServerResponse): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Body parsing helper
+// ---------------------------------------------------------------------------
+
+/** Max body size for POST requests (64 KiB — more than enough for JSON control messages). */
+const MAX_BODY_BYTES = 64 * 1024
+
+/**
+ * Read the request body as a parsed JSON object.
+ * Returns the parsed value, or throws a descriptive error string.
+ */
+function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let totalBytes = 0
+
+    req.on('data', (chunk: Buffer) => {
+      totalBytes += chunk.length
+      if (totalBytes > MAX_BODY_BYTES) {
+        req.destroy()
+        reject('Request body too large')
+        return
+      }
+      chunks.push(chunk)
+    })
+
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8')
+      if (!raw.trim()) {
+        // Empty body is treated as empty object
+        resolve({})
+        return
+      }
+      try {
+        const parsed = JSON.parse(raw)
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          reject('Body must be a JSON object')
+          return
+        }
+        resolve(parsed as Record<string, unknown>)
+      } catch {
+        reject('Invalid JSON')
+      }
+    })
+
+    req.on('error', () => {
+      reject('Request read error')
+    })
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Request handler
 // ---------------------------------------------------------------------------
 
-function handleRequest(req: IncomingMessage, res: ServerResponse): void {
+function createRequestHandler(deps: HttpServerDeps) {
+  return function handleRequest(req: IncomingMessage, res: ServerResponse): void {
+    // Delegate to async handler, catch unhandled promise rejections
+    handleRequestAsync(req, res, deps).catch((err) => {
+      console.error('[httpServer] Unhandled error in request handler:', err)
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: 'Internal Server Error' })
+      }
+    })
+  }
+}
+
+async function handleRequestAsync(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: HttpServerDeps,
+): Promise<void> {
   const { method, url } = req
 
   // CORS preflight
@@ -147,9 +235,117 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
     return
   }
 
-  // Route: GET /sessions
+  // Route: GET /sessions/history — list all scannable sessions
+  if (method === 'GET' && url === '/sessions/history') {
+    if (!deps.scanSessions) {
+      sendJson(res, 200, { sessions: [] })
+      return
+    }
+    const sessions = await deps.scanSessions()
+    sendJson(res, 200, { sessions })
+    return
+  }
+
+  // Route: GET /sessions — alias for /sessions/history (backward compat)
   if (method === 'GET' && url === '/sessions') {
-    sendJson(res, 200, [])
+    if (!deps.scanSessions) {
+      sendJson(res, 200, { sessions: [] })
+      return
+    }
+    const sessions = await deps.scanSessions()
+    sendJson(res, 200, { sessions })
+    return
+  }
+
+  // Route: GET /sessions/status — current process state
+  if (method === 'GET' && url === '/sessions/status') {
+    const pm = deps.processManager
+    if (!pm) {
+      sendJson(res, 200, { state: 'idle' as ProcessState })
+      return
+    }
+    sendJson(res, 200, {
+      state: pm.state,
+      ...(pm.sessionId ? { sessionId: pm.sessionId } : {}),
+    })
+    return
+  }
+
+  // Route: POST /sessions/start — start a new or resumed session
+  if (method === 'POST' && url === '/sessions/start') {
+    const pm = deps.processManager
+    if (!pm) {
+      sendJson(res, 500, { error: 'Process manager not available' })
+      return
+    }
+
+    // Reject if already running/spawning
+    if (pm.state !== 'idle') {
+      sendJson(res, 409, {
+        error: `Cannot start: process is in '${pm.state}' state`,
+        state: pm.state,
+      })
+      return
+    }
+
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+      return
+    }
+
+    // Validate body fields
+    const sessionId = body.sessionId
+    const cwd = body.cwd
+
+    if (sessionId !== undefined && typeof sessionId !== 'string') {
+      sendJson(res, 400, { error: 'sessionId must be a string' })
+      return
+    }
+    if (cwd !== undefined && typeof cwd !== 'string') {
+      sendJson(res, 400, { error: 'cwd must be a string' })
+      return
+    }
+
+    // Build spawn options
+    const spawnOpts: SpawnClaudeOptions = {}
+    if (sessionId) {
+      spawnOpts.mode = 'resume'
+      spawnOpts.sessionId = sessionId
+    } else {
+      spawnOpts.mode = 'new'
+    }
+
+    const targetCwd = (cwd as string | undefined) ?? process.cwd()
+
+    try {
+      const proc = await pm.start(targetCwd, spawnOpts)
+      // Notify index.ts (or whoever registered the callback) so it can
+      // wire up lineReader, WS bridge, etc.
+      deps.onSessionStarted?.(proc)
+      sendJson(res, 200, {
+        ok: true,
+        sessionId: pm.sessionId ?? null,
+      })
+    } catch (err) {
+      // start() throws if state is not idle (concurrent spawn race)
+      const message = err instanceof Error ? err.message : 'Spawn failed'
+      sendJson(res, 409, { error: message })
+    }
+    return
+  }
+
+  // Route: POST /sessions/stop — stop the current process
+  if (method === 'POST' && url === '/sessions/stop') {
+    const pm = deps.processManager
+    if (!pm) {
+      sendJson(res, 200, { ok: true })
+      return
+    }
+    await pm.stop()
+    sendJson(res, 200, { ok: true })
     return
   }
 
@@ -189,11 +385,16 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
  * WebSocket upgrade support.
  *
  * @param port - Port number to listen on (0 for random)
+ * @param deps - Optional dependencies (processManager, scanSessions, etc.)
  * @returns The http.Server instance and the resolved URL
  */
-export function startHttpServer(port: number): Promise<{ server: HttpServer; url: string }> {
+export function startHttpServer(
+  port: number,
+  deps?: HttpServerDeps,
+): Promise<{ server: HttpServer; url: string }> {
   return new Promise((resolve, reject) => {
-    const server = createServer(handleRequest)
+    const handler = createRequestHandler(deps ?? {})
+    const server = createServer(handler)
 
     server.on('error', reject)
 
