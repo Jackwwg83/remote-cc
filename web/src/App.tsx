@@ -150,6 +150,12 @@ export default function App() {
         return
       }
 
+      // B-01: User message replay from server — add to messages list
+      if (d.type === 'user') {
+        setMessages((prev) => [...prev, data as ChatMessage])
+        return
+      }
+
       // T-19: control_request (permission approval)
       if (d.type === 'control_request') {
         const req = data as PermissionRequest
