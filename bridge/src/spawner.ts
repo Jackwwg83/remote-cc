@@ -129,20 +129,53 @@ export interface SpawnClaudeOptions {
    * @internal
    */
   _rawArgs?: string[]
+  /** Session spawn mode: new session, resume a specific session, or continue the most recent. */
+  mode?: 'new' | 'resume' | 'continue'
+  /** Session ID (full UUID) — required when mode is 'resume'. */
+  sessionId?: string
+}
+
+/**
+ * Build the full args array for a Claude process invocation.
+ *
+ * Exported for unit testing so tests can verify arg construction without
+ * actually spawning a process.
+ *
+ * @param opts - The same SpawnClaudeOptions passed to spawnClaude()
+ * @throws SpawnError if mode is 'resume' but sessionId is missing/empty
+ */
+export function buildArgs(opts?: SpawnClaudeOptions): string[] {
+  const baseArgs = opts?._rawArgs ?? [...CLAUDE_ARGS]
+  const modeArgs: string[] = []
+
+  const mode = opts?.mode ?? 'new'
+  if (mode === 'resume') {
+    if (!opts?.sessionId) {
+      throw new SpawnError('sessionId is required when mode is "resume"')
+    }
+    modeArgs.push('--resume', opts.sessionId)
+  } else if (mode === 'continue') {
+    modeArgs.push('--continue')
+  }
+  // mode === 'new' or undefined: no extra flags
+
+  return [...baseArgs, ...modeArgs, ...(opts?.extraArgs ?? [])]
 }
 
 /**
  * Spawn a claude process configured for stream-json communication.
  *
- * @param cwd - Working directory for the child process
- * @param opts - Optional overrides (command name, extra args/env)
+ * @param cwd - Working directory for the child process. Claude resolves
+ *   sessions from `~/.claude/projects/{cwd-hash}/`, so the cwd MUST match
+ *   the session's original working directory when resuming.
+ * @param opts - Optional overrides (command name, extra args/env, mode)
  * @returns A ClaudeProcess handle
- * @throws SpawnError if the spawn call itself fails synchronously
+ * @throws SpawnError if the spawn call itself fails synchronously, or if
+ *   mode is 'resume' but sessionId is not provided
  */
 export function spawnClaude(cwd: string, opts?: SpawnClaudeOptions): ClaudeProcess {
   const command = opts?.command ?? 'claude'
-  const baseArgs = opts?._rawArgs ?? [...CLAUDE_ARGS]
-  const args = [...baseArgs, ...(opts?.extraArgs ?? [])]
+  const args = buildArgs(opts)
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
