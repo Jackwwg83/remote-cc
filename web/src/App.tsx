@@ -244,8 +244,11 @@ export default function App() {
     setInput('')
   }, [input])
 
+  // IME composition guard — don't submit while composing (Chinese/Japanese/Korean input)
+  const isComposingRef = useRef(false)
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !isComposingRef.current) {
       e.preventDefault()
       sendMessage()
     }
@@ -392,6 +395,8 @@ export default function App() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
+            onCompositionStart={() => { isComposingRef.current = true }}
+            onCompositionEnd={() => { isComposingRef.current = false }}
             placeholder={status === 'connected' ? 'Type a message...' : 'Waiting for connection...'}
             disabled={status !== 'connected'}
             className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white p-3 rounded-lg outline-none
