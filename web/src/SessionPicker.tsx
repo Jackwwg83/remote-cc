@@ -1,5 +1,6 @@
 // T-F09: Session selection UI — list recent sessions or start a new one
 import { useState, useEffect, useCallback } from 'react'
+import { getAuthHeaders } from './App'
 
 interface SessionInfo {
   id: string
@@ -46,7 +47,7 @@ export default function SessionPicker({ onSelect, onNew }: SessionPickerProps) {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('/sessions/history')
+      const res = await fetch('/sessions/history', { headers: getAuthHeaders() })
       if (!res.ok) {
         throw new Error(`Server returned ${res.status}`)
       }

@@ -99,6 +99,7 @@ async function main() {
     processManager: pm,
     scanSessions: () => scanSessions(),
     onSessionStarted: (proc) => wireSession(proc),
+    authToken: token,
   })
 
   // -----------------------------------------------------------------------
@@ -163,21 +164,19 @@ async function main() {
   function wireSession(proc: ClaudeProcess): void {
     console.log('   Wiring new session...')
 
-    // Update session state
-    sessionState = 'running'
-
-    // Broadcast session_status = running to all connected clients
-    ws.broadcast(JSON.stringify({
-      type: 'system',
-      subtype: 'session_status',
-      state: 'running',
-    }))
+    // Unregister previous session's message handler to prevent leaks
+    if (currentMessageHandler) {
+      ws.offMessage(currentMessageHandler)
+      currentMessageHandler = null
+    }
 
     // Create line reader for claude stdout
     const reader = createLineReader(proc.stdout)
     const iterator = reader[Symbol.asyncIterator]()
 
     // Run the initialize handshake, then start bridging
+    // NOTE: session_status = running is broadcast AFTER init completes (not before)
+    // to ensure clients don't send messages before the bridge is ready.
     ;(async () => {
       try {
         const initResult = await waitForInitialize(
@@ -204,6 +203,14 @@ async function main() {
       }
 
       console.log('   Claude process ready (initialize handshake complete)')
+
+      // Broadcast session_status = running AFTER init completes
+      sessionState = 'running'
+      ws.broadcast(JSON.stringify({
+        type: 'system',
+        subtype: 'session_status',
+        state: 'running',
+      }))
 
       // -------------------------------------------------------------------
       // Bidirectional bridge
@@ -243,11 +250,11 @@ async function main() {
     proc.once('exit', (code) => {
       console.log(`\n   Claude process exited with code ${code ?? 0}`)
 
-      // Note: we don't unregister the onMessage handler because wsServer
-      // doesn't expose an unsubscribe API. The handler references the old
-      // proc.stdin which is now closed, so writes will silently fail.
-      // On the next wireSession() call, a new handler is registered.
-      currentMessageHandler = null
+      // Unregister the message handler to prevent stale writes
+      if (currentMessageHandler) {
+        ws.offMessage(currentMessageHandler)
+        currentMessageHandler = null
+      }
 
       // Reset seq counter and message cache for the next session
       seq = 0

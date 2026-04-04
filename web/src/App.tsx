@@ -9,6 +9,19 @@ import InstallPrompt from './InstallPrompt'
 import QuickCommands from './QuickCommands'
 import SessionPicker from './SessionPicker'
 
+/** Extract the auth token from the page URL (?token=xxx) */
+function getAuthToken(): string | null {
+  return new URLSearchParams(window.location.search).get('token')
+}
+
+/** Build headers with auth token for HTTP API requests */
+export function getAuthHeaders(): Record<string, string> {
+  const token = getAuthToken()
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  return headers
+}
+
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
   // Infer WS URL from current page location (same host:port, ws:// protocol)
@@ -332,7 +345,7 @@ export default function App() {
       if (cwd) body.cwd = cwd
       const res = await fetch('/sessions/start', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAuthHeaders(),
         body: JSON.stringify(body),
       })
       if (!res.ok) {

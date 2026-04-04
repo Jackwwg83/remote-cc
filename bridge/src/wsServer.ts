@@ -37,6 +37,8 @@ export interface WsServer {
   broadcast(data: string): void
   /** Register a callback for messages received from any client. */
   onMessage(cb: (data: string) => void): void
+  /** Unregister a previously registered message callback. */
+  offMessage(cb: (data: string) => void): void
   /** Register a callback for new connections. Receives the WebSocket and upgrade request. */
   onConnection(cb: (socket: WebSocket, req: IncomingMessage) => void): void
   /** Number of currently connected clients. */
@@ -119,6 +121,11 @@ export function createWsServer(httpServer: HttpServer, options?: WsServerOptions
 
     onMessage(cb: (data: string) => void): void {
       messageCallbacks.push(cb)
+    },
+
+    offMessage(cb: (data: string) => void): void {
+      const idx = messageCallbacks.indexOf(cb)
+      if (idx !== -1) messageCallbacks.splice(idx, 1)
     },
 
     onConnection(cb: (socket: WebSocket, req: IncomingMessage) => void): void {

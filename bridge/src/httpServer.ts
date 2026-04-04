@@ -49,6 +49,9 @@ export interface HttpServerDeps {
   /** Called after a process is started via POST /sessions/start.
    *  index.ts hooks this to wire up lineReader, WS bridge, etc. */
   onSessionStarted?: (proc: ClaudeProcess) => void
+  /** Auth token for session control endpoints. If set, these endpoints require
+   *  `Authorization: Bearer <token>` header or `?token=` query parameter. */
+  authToken?: string
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -147,6 +150,24 @@ function tryServeStatic(urlPath: string, res: ServerResponse): boolean {
 // Body parsing helper
 // ---------------------------------------------------------------------------
 
+/**
+ * Check if the request carries a valid auth token (header or query param).
+ * Returns true if auth passes or no token is required.
+ */
+function checkAuth(req: IncomingMessage, token: string | undefined): boolean {
+  if (!token) return true // no auth required
+  // Check Authorization header
+  const authHeader = req.headers['authorization']
+  if (authHeader === `Bearer ${token}`) return true
+  // Fallback: check ?token= query parameter
+  try {
+    const url = new URL(req.url ?? '', `http://${req.headers.host}`)
+    const queryToken = url.searchParams.get('token')
+    if (queryToken === token) return true
+  } catch { /* malformed URL */ }
+  return false
+}
+
 /** Max body size for POST requests (64 KiB — more than enough for JSON control messages). */
 const MAX_BODY_BYTES = 64 * 1024
 
@@ -237,6 +258,10 @@ async function handleRequestAsync(
 
   // Route: GET /sessions/history — list all scannable sessions
   if (method === 'GET' && url === '/sessions/history') {
+    if (!checkAuth(req, deps.authToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
     if (!deps.scanSessions) {
       sendJson(res, 200, { sessions: [] })
       return
@@ -248,6 +273,10 @@ async function handleRequestAsync(
 
   // Route: GET /sessions — alias for /sessions/history (backward compat)
   if (method === 'GET' && url === '/sessions') {
+    if (!checkAuth(req, deps.authToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
     if (!deps.scanSessions) {
       sendJson(res, 200, { sessions: [] })
       return
@@ -259,6 +288,10 @@ async function handleRequestAsync(
 
   // Route: GET /sessions/status — current process state
   if (method === 'GET' && url === '/sessions/status') {
+    if (!checkAuth(req, deps.authToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
     const pm = deps.processManager
     if (!pm) {
       sendJson(res, 200, { state: 'idle' as ProcessState })
@@ -273,6 +306,10 @@ async function handleRequestAsync(
 
   // Route: POST /sessions/start — start a new or resumed session
   if (method === 'POST' && url === '/sessions/start') {
+    if (!checkAuth(req, deps.authToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
     const pm = deps.processManager
     if (!pm) {
       sendJson(res, 500, { error: 'Process manager not available' })
@@ -339,6 +376,10 @@ async function handleRequestAsync(
 
   // Route: POST /sessions/stop — stop the current process
   if (method === 'POST' && url === '/sessions/stop') {
+    if (!checkAuth(req, deps.authToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
     const pm = deps.processManager
     if (!pm) {
       sendJson(res, 200, { ok: true })
