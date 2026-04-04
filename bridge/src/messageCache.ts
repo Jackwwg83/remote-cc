@@ -25,6 +25,8 @@ export interface MessageCache {
   replayWithSeq(fromSeq: number): ReplayEntry[]
   /** Return the latest sequence number, or 0 if empty. */
   currentSeq(): number
+  /** Clear all cached messages and reset state. */
+  clear(): void
 }
 
 interface CacheEntry {
@@ -78,6 +80,13 @@ export function createMessageCache(maxMessages = 200): MessageCache {
 
     currentSeq(): number {
       return latestSeq
+    },
+
+    clear(): void {
+      buffer.fill(undefined)
+      writeIndex = 0
+      count = 0
+      latestSeq = 0
     },
   }
 }

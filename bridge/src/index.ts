@@ -1,24 +1,27 @@
 #!/usr/bin/env node
 /**
- * remote-cc bridge — spawn claude + WebSocket server + terminal UI
+ * remote-cc bridge — HTTP server + WebSocket server + session lifecycle
  *
  * Wires together all modules:
- *   HTTP server  →  serves web UI static files
+ *   HTTP server  →  serves web UI static files + session API
  *   WS server    →  attaches to HTTP server for WebSocket upgrade
- *   spawner      →  launches claude child process
+ *   processManager → manages claude process lifecycle (start/stop/status)
+ *   sessionScanner → scans ~/.claude/projects/ for existing sessions
  *   lineReader   →  buffered line reader for claude stdout
  *   initializer  →  handles the initialize handshake
  *   terminalUI   →  prints startup banner and connection status
  *
- * Data flow:
- *   Web client  →  WS  →  claude stdin
- *   claude stdout  →  WS broadcast  →  all Web clients
+ * Startup flow:
+ *   1. Start HTTP + WS servers
+ *   2. Broadcast "waiting_for_session" to connected clients
+ *   3. Wait for POST /sessions/start from web UI
+ *   4. wireSession(): lineReader → initializer → bidirectional bridge
+ *   5. On process exit: broadcast session_ended, reset, wait for next session
  */
 
 import { parseArgs } from 'node:util'
 import { startHttpServer } from './httpServer.js'
 import { createWsServer } from './wsServer.js'
-import { spawnClaude, SpawnError } from './spawner.js'
 import { createLineReader, writeLine } from './lineReader.js'
 import { waitForInitialize, InitializeTimeoutError } from './initializer.js'
 import { printStartupBanner } from './terminalUI.js'
@@ -26,6 +29,9 @@ import { generateToken, createVerifyClient } from './auth.js'
 import { createMessageCache } from './messageCache.js'
 import { detectTailscale } from './tailscale.js'
 import { checkClaudeVersion } from './versionCheck.js'
+import { createProcessManager } from './processManager.js'
+import { scanSessions } from './sessionScanner.js'
+import type { ClaudeProcess } from './spawner.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -63,7 +69,7 @@ async function main() {
   const port = parseInt(args.port ?? '7860', 10)
 
   // -----------------------------------------------------------------------
-  // 0. T-38: Claude CLI version compatibility check (non-blocking)
+  // 0. Claude CLI version compatibility check (non-blocking)
   // -----------------------------------------------------------------------
   const versionResult = await checkClaudeVersion()
   if (versionResult.warning) {
@@ -78,26 +84,48 @@ async function main() {
   const token = generateToken()
 
   // -----------------------------------------------------------------------
-  // 2. Start HTTP server (serves web UI static files + health/sessions API)
+  // 2. Create process manager (manages claude process lifecycle)
   // -----------------------------------------------------------------------
-  const { server, url } = await startHttpServer(port)
+  const pm = createProcessManager()
 
   // -----------------------------------------------------------------------
-  // 3. Create WebSocket server with token auth
+  // 3. Start HTTP server with deps (processManager, sessionScanner, callback)
+  // -----------------------------------------------------------------------
+  const { server, url } = await startHttpServer(port, {
+    processManager: pm,
+    scanSessions: () => scanSessions(),
+    onSessionStarted: (proc) => wireSession(proc),
+  })
+
+  // -----------------------------------------------------------------------
+  // 4. Create WebSocket server with token auth
   // -----------------------------------------------------------------------
   const ws = createWsServer(server, {
     verifyClient: createVerifyClient(token),
   })
 
   // -----------------------------------------------------------------------
-  // 4. Create message cache for reconnect replay
+  // 5. Create message cache for reconnect replay
   // -----------------------------------------------------------------------
   const cache = createMessageCache(200)
   let seq = 0
 
-  // On new connection, check ?last_seq query param and replay cached messages
-  // Replayed messages use the same seq envelope format as live broadcasts.
+  // Track current session state for new WS connections
+  let sessionState: 'waiting_for_session' | 'running' = 'waiting_for_session'
+
+  // -----------------------------------------------------------------------
+  // 6. On new WS connection: send current session state + replay cache
+  // -----------------------------------------------------------------------
   ws.onConnection((socket, req) => {
+    // Always send current session status to newly connected clients
+    const statusMsg = JSON.stringify({
+      type: 'system',
+      subtype: 'session_status',
+      state: sessionState,
+    })
+    socket.send(statusMsg)
+
+    // Replay cached messages if client provides ?last_seq
     const urlObj = new URL(req.url ?? '/', 'http://localhost')
     const lastSeqParam = urlObj.searchParams.get('last_seq')
     if (lastSeqParam !== null) {
@@ -116,111 +144,140 @@ async function main() {
   })
 
   // -----------------------------------------------------------------------
-  // 5. Detect Tailscale + print terminal UI banner (with token in URLs)
+  // 7. Detect Tailscale + print terminal UI banner (with token in URLs)
   // -----------------------------------------------------------------------
   const tailscale = await detectTailscale()
   await printStartupBanner(url, port, token, tailscale)
 
   // -----------------------------------------------------------------------
-  // 6. Spawn claude process
+  // 8. wireSession() — called when POST /sessions/start spawns a process
   // -----------------------------------------------------------------------
-  let claude
-  try {
-    claude = spawnClaude(process.cwd())
-  } catch (err) {
-    if (err instanceof SpawnError) {
-      console.error(`\nFailed to start claude: ${err.message}`)
-      console.error(
-        'Make sure "claude" is installed and available in your PATH.\n' +
-        'Install: npm install -g @anthropic-ai/claude-code\n',
-      )
-    } else {
-      console.error('\nUnexpected error spawning claude:', err)
-    }
-    ws.close()
-    server.close()
-    process.exit(1)
-  }
+  // Track the current onMessage unsubscribe handle so we can clean up
+  // between sessions (onMessage callbacks accumulate otherwise).
+  let currentMessageHandler: ((data: string) => void) | null = null
 
-  // -----------------------------------------------------------------------
-  // 7. Create line reader for claude stdout
-  // -----------------------------------------------------------------------
-  const reader = createLineReader(claude.stdout)
-  const iterator = reader[Symbol.asyncIterator]()
+  function wireSession(proc: ClaudeProcess): void {
+    console.log('   Wiring new session...')
 
-  // -----------------------------------------------------------------------
-  // 8. Initialize handshake — must complete before we start bridging
-  // -----------------------------------------------------------------------
-  try {
-    const initResult = await waitForInitialize(
-      iterator,
-      (obj) => writeLine(claude.stdin, obj),  // for SDK mode control_response
-    )
-    console.log(`✅ Claude is ready (${initResult.mode})`)
-    // Cache early messages so they can be replayed to clients that connect later
-    for (const msg of initResult.earlyMessages) {
-      seq++
-      cache.push(msg, seq)
-    }
-  } catch (err) {
-    if (err instanceof InitializeTimeoutError) {
-      console.error('\n❌ Claude did not produce any output within timeout.')
-      console.error('Is claude installed? Try: claude --version\n')
-    } else {
-      console.error('\n❌ Claude startup failed:', err)
-    }
-    claude.kill()
-    ws.close()
-    server.close()
-    process.exit(1)
-  }
+    // Update session state
+    sessionState = 'running'
 
-  console.log('   Claude process ready (initialize handshake complete)')
+    // Broadcast session_status = running to all connected clients
+    ws.broadcast(JSON.stringify({
+      type: 'system',
+      subtype: 'session_status',
+      state: 'running',
+    }))
 
-  // -----------------------------------------------------------------------
-  // 9. Bidirectional bridge
-  //    WS client message  →  write to claude stdin
-  //    claude stdout line  →  cache + broadcast to all WS clients
-  // -----------------------------------------------------------------------
+    // Create line reader for claude stdout
+    const reader = createLineReader(proc.stdout)
+    const iterator = reader[Symbol.asyncIterator]()
 
-  // Client → claude
-  ws.onMessage((data: string) => {
-    try {
-      const parsed = JSON.parse(data)
-      writeLine(claude.stdin, parsed)
-    } catch {
-      // Malformed JSON from client — silently ignore
-    }
-  })
+    // Run the initialize handshake, then start bridging
+    ;(async () => {
+      try {
+        const initResult = await waitForInitialize(
+          iterator,
+          (obj) => writeLine(proc.stdin, obj),
+        )
+        console.log(`✅ Claude is ready (${initResult.mode})`)
 
-  // claude → cache + broadcast to all clients (continuous read loop)
-  // Each message is wrapped in a seq envelope: {"seq": N, "data": "<original JSON>"}
-  // so the web client can track its position and request replay on reconnect.
-  ;(async () => {
-    try {
-      for (;;) {
-        const { value, done } = await iterator.next()
-        if (done) break
-        // Assign sequence number, cache raw message, broadcast with seq envelope
-        seq++
-        cache.push(value, seq)
-        const envelope = JSON.stringify({ seq, data: value })
-        ws.broadcast(envelope)
+        // Cache early messages so they can be replayed to late-connecting clients
+        for (const msg of initResult.earlyMessages) {
+          seq++
+          cache.push(msg, seq)
+        }
+      } catch (err) {
+        if (err instanceof InitializeTimeoutError) {
+          console.error('\n❌ Claude did not produce any output within timeout.')
+          console.error('Is claude installed? Try: claude --version\n')
+        } else {
+          console.error('\n❌ Claude startup failed:', err)
+        }
+        // Kill the process and let the exit handler reset state
+        proc.kill()
+        return
       }
-    } catch (err) {
-      console.error('Error reading claude stdout:', err)
-    }
-  })()
+
+      console.log('   Claude process ready (initialize handshake complete)')
+
+      // -------------------------------------------------------------------
+      // Bidirectional bridge
+      //   WS client message → write to claude stdin
+      //   claude stdout line → cache + broadcast to all WS clients
+      // -------------------------------------------------------------------
+
+      // Client → claude (register a new message handler)
+      currentMessageHandler = (data: string) => {
+        try {
+          const parsed = JSON.parse(data)
+          writeLine(proc.stdin, parsed)
+        } catch {
+          // Malformed JSON from client — silently ignore
+        }
+      }
+      ws.onMessage(currentMessageHandler)
+
+      // claude → cache + broadcast (continuous read loop)
+      try {
+        for (;;) {
+          const { value, done } = await iterator.next()
+          if (done) break
+          seq++
+          cache.push(value, seq)
+          const envelope = JSON.stringify({ seq, data: value })
+          ws.broadcast(envelope)
+        }
+      } catch (err) {
+        console.error('Error reading claude stdout:', err)
+      }
+    })()
+
+    // -------------------------------------------------------------------
+    // Process exit handler — reset to waiting state (don't exit the bridge)
+    // -------------------------------------------------------------------
+    proc.once('exit', (code) => {
+      console.log(`\n   Claude process exited with code ${code ?? 0}`)
+
+      // Note: we don't unregister the onMessage handler because wsServer
+      // doesn't expose an unsubscribe API. The handler references the old
+      // proc.stdin which is now closed, so writes will silently fail.
+      // On the next wireSession() call, a new handler is registered.
+      currentMessageHandler = null
+
+      // Reset seq counter and message cache for the next session
+      seq = 0
+      cache.clear()
+
+      // Update session state
+      sessionState = 'waiting_for_session'
+
+      // Broadcast session_ended + new waiting status to all clients
+      ws.broadcast(JSON.stringify({
+        type: 'system',
+        subtype: 'session_status',
+        state: 'session_ended',
+        exitCode: code ?? 0,
+      }))
+      ws.broadcast(JSON.stringify({
+        type: 'system',
+        subtype: 'session_status',
+        state: 'waiting_for_session',
+      }))
+
+      console.log('   Bridge waiting for next session...')
+    })
+  }
 
   // -----------------------------------------------------------------------
-  // 10. Claude process exit handler
+  // 9. Broadcast initial "waiting_for_session" status
   // -----------------------------------------------------------------------
-  claude.on('exit', (code) => {
-    console.log(`\n   Claude process exited with code ${code ?? 0}`)
-    ws.close()
-    server.close()
-    process.exit(code ?? 0)
-  })
+  console.log('   Bridge started — waiting for session start via web UI')
+  ws.broadcast(JSON.stringify({
+    type: 'system',
+    subtype: 'session_status',
+    state: 'waiting_for_session',
+  }))
 }
 
 main().catch(err => {
