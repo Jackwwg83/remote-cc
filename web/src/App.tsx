@@ -177,16 +177,18 @@ export default function App() {
         return
       }
 
-      // Result message: show as status, not raw JSON
+      // Result message: skip — assistant message already contains the reply.
+      // Only show result if it's an error.
       if (d.type === 'result') {
         const result = d as Record<string, unknown>
-        const text = (result.result as string) || (result.subtype === 'success' ? 'Completed' : 'Error')
-        setMessages((prev) => [...prev, {
-          type: 'system',
-          subtype: 'status',
-          text,
-          _original: data,
-        } as unknown as ChatMessage])
+        if (result.is_error || result.subtype === 'error') {
+          setMessages((prev) => [...prev, {
+            type: 'system',
+            subtype: 'status',
+            text: `Error: ${(result.result as string) || 'Unknown error'}`,
+            _original: data,
+          } as unknown as ChatMessage])
+        }
         return
       }
     })
