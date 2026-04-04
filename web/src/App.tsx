@@ -242,7 +242,7 @@ export default function App() {
         response: {
           subtype: 'success',
           request_id: action.requestId,
-          response: { behavior: 'allow', updatedInput: null },
+          response: { behavior: 'allow', updatedInput: {} },
         },
       })
     } else {
