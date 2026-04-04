@@ -103,3 +103,4 @@
 - [ ] B-03: 多种 system subtype 暴露 — status, task_started, task_progress, task_notification, session_state_changed, files_persisted, api_retry, rate_limit 都没过滤，显示了 raw JSON。需要加到 skipSubtypes 或者格式化显示
 - [ ] B-04: AskUserQuestion 工具调用显示 raw JSON — 应该渲染成交互式选择 UI（选项按钮），用户点选后发回 tool_result
 - [ ] B-05: EnterPlanMode 工具调用显示 {} — 应该渲染成"进入计划模式"的状态提示，不是空 JSON
+- [ ] B-06: 主题切换 — Web UI 加深色/浅色模式切换按钮，默认跟随系统 prefers-color-scheme，可手动切换并 localStorage 持久化
