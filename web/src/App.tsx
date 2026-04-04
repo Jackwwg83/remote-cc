@@ -150,18 +150,16 @@ export default function App() {
         return
       }
 
-      // B-01: User message replay from server — add to messages list
-      // B-08: Skip tool_result messages disguised as user messages
+      // B-01: User message replay — only show real user text messages
+      // B-08: Skip tool_result, tool_use, and other non-text content
       if (d.type === 'user') {
         const msg = d as Record<string, unknown>
         const content = (msg.message as Record<string, unknown>)?.content
-        // If content is an array containing tool_result, skip (not a real user message)
-        if (Array.isArray(content) && content.some((b: unknown) =>
-          typeof b === 'object' && b !== null && (b as Record<string, unknown>).type === 'tool_result'
-        )) {
-          return
+        // Only show if content is a plain string (real user input)
+        if (typeof content === 'string' && content.trim()) {
+          setMessages((prev) => [...prev, data as ChatMessage])
         }
-        setMessages((prev) => [...prev, data as ChatMessage])
+        // Array content (tool_result, images, etc.) = not a real user message → skip
         return
       }
 
