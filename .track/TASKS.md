@@ -106,3 +106,15 @@
 - [ ] B-06: 主题切换 — Web UI 加深色/浅色模式切换按钮，默认跟随系统 prefers-color-scheme，可手动切换并 localStorage 持久化
 - [ ] B-07: 权限弹窗缺 "Always Allow" — 原版有三个选项：Allow / Always Allow / Deny。Always Allow 通过 control_response 的 updatedPermissions 字段传递权限规则，Claude 会持久化。参考 rdcc PermissionPromptToolResultSchema.ts 的 updatedPermissions 字段
 - [ ] B-08: tool_result 在 user replay 消息里显示为蓝色气泡 — user replay 消息的 content 如果是 tool_result 数组，不应该显示为普通文字气泡，应该跳过或格式化显示
+
+---
+
+## 功能缺口（手机联合测试发现，走新增功能流程）
+
+### 必做（不做基本不可用）
+- [ ] F-01: Session 管理 — 支持 --continue（恢复最近会话）和 --resume <session_id>（指定会话），通过 bridge CLI 参数或 web UI 选择
+- [ ] F-02: Slash commands — /model /compact /clear /cost 等需要通过 control_request 协议发送，不是 user message。Quick Commands 面板需要重做
+
+### 应做（提升体验）
+- [ ] F-03: 会话列表 — web UI 显示可用 sessions，点击切换
+- [ ] F-04: 模型切换 — web UI 的模型选择器，通过 set_model control_request 切换
