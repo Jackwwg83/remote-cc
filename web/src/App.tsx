@@ -1,4 +1,4 @@
-// T-10/T-13/T-14/T-19-21/T-32-34: Chat interface with streaming, permission approval, reconnect for remote-cc web UI
+// T-10/T-13/T-14/T-19-21/T-32-34/T-F10: Chat interface with streaming, permission approval, reconnect, session picker for remote-cc web UI
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { connectWs, type WsState, type ReconnectMeta } from './ws'
@@ -7,6 +7,7 @@ import { createStreamingState, streamingToContent, type StreamingMessage } from 
 import PermissionDialog, { type PermissionRequest, type PermissionAction } from './PermissionDialog'
 import InstallPrompt from './InstallPrompt'
 import QuickCommands from './QuickCommands'
+import SessionPicker from './SessionPicker'
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
@@ -49,6 +50,8 @@ export default function App() {
   const [input, setInput] = useState('')
   // T-19: Pending permission requests (Map<request_id, PermissionRequest>)
   const [pendingPerms, setPendingPerms] = useState<Map<string, PermissionRequest>>(new Map())
+  // T-F10: View state — show session picker or chat interface
+  const [view, setView] = useState<'picker' | 'chat'>('picker')
   const bottomRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<ReturnType<typeof connectWs> | null>(null)
   const streamStateRef = useRef(createStreamingState())
@@ -176,6 +179,24 @@ export default function App() {
         return
       }
 
+      // T-F10: Handle session_status messages to switch between picker and chat
+      if (d.type === 'system' && d.subtype === 'session_status') {
+        const sessionState = d.state as string
+        if (sessionState === 'waiting_for_session') {
+          setView('picker')
+        } else if (sessionState === 'running') {
+          setView('chat')
+        } else if (sessionState === 'session_ended') {
+          // Clear chat state for next session
+          setMessages([])
+          setStreamingMsg(null)
+          setPendingPerms(new Map())
+          streamStateRef.current.reset()
+          setView('picker')
+        }
+        return  // Don't add to messages
+      }
+
       // Filter: only show user-visible system messages
       if (d.type === 'system') {
         const sub = (d as Record<string, unknown>).subtype as string
@@ -187,6 +208,7 @@ export default function App() {
           'task_started', 'task_progress', 'task_notification',
           'session_state_changed', 'files_persisted',
           'status', 'api_retry', 'rate_limit', 'rate_limit_event',
+          'session_status',
         ])
         if (!skipSubtypes.has(sub)) {
           setMessages((prev) => [...prev, data as ChatMessage])
@@ -302,6 +324,27 @@ export default function App() {
     })
   }, [])
 
+  // T-F10: Start a new or existing session via REST API
+  const startSession = useCallback(async (sessionId?: string, cwd?: string) => {
+    try {
+      const body: Record<string, string> = {}
+      if (sessionId) body.sessionId = sessionId
+      if (cwd) body.cwd = cwd
+      const res = await fetch('/sessions/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) {
+        const data = await res.json()
+        console.error('Failed to start session:', data.error)
+      }
+      // View switch happens when bridge broadcasts session_status: running
+    } catch (err) {
+      console.error('Failed to start session:', err)
+    }
+  }, [])
+
   // Build the streaming ChatMessage to display at the bottom
   const streamingChatMsg: ChatMessage | null = streamingMsg
     ? {
@@ -371,61 +414,71 @@ export default function App() {
         </div>
       )}
 
-      {/* Messages */}
-      <main className="flex-1 overflow-y-auto px-2 py-4 sm:px-4">
-        {messages.length === 0 && !streamingChatMsg && (
-          <p className="text-gray-500 text-center mt-20">Send a message to get started</p>
-        )}
-        {messages.map((msg, i) => (
-          <MessageRenderer key={i} msg={msg} />
-        ))}
-        {streamingChatMsg && (
-          <MessageRenderer msg={streamingChatMsg} />
-        )}
-        <div ref={bottomRef} />
-      </main>
-
-      {/* Input */}
-      <footer className="px-2 py-2 sm:px-4 sm:py-4 border-t border-gray-200 dark:border-gray-700 shrink-0 pb-[env(safe-area-inset-bottom,8px)]">
-        {/* T-36: Quick command panel — mobile only */}
-        <QuickCommands
-          onCommand={(cmd) => {
-            if (!wsRef.current || status !== 'connected') return
-            const msg: ChatMessage = {
-              type: 'user',
-              message: { role: 'user', content: cmd },
-              parent_tool_use_id: null,
-              session_id: '',
-            }
-            // B-01: No local echo — let server replay add the message
-            wsRef.current.send(msg)
-          }}
+      {/* T-F10: Conditional rendering — session picker or chat interface */}
+      {view === 'picker' ? (
+        <SessionPicker
+          onSelect={(id, cwd) => startSession(id, cwd)}
+          onNew={() => startSession()}
         />
-        <div className="flex gap-2">
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onCompositionStart={() => { isComposingRef.current = true }}
-            onCompositionEnd={() => { isComposingRef.current = false }}
-            placeholder={status === 'connected' ? 'Type a message...' : 'Waiting for connection...'}
-            disabled={status !== 'connected'}
-            className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white p-3 rounded-lg outline-none
-              focus:ring-2 focus:ring-blue-500 min-h-[44px] text-base
-              disabled:opacity-50 disabled:cursor-not-allowed"
-          />
-          <button
-            onClick={sendMessage}
-            disabled={status !== 'connected' || !input.trim()}
-            className="px-4 py-3 bg-blue-600 rounded-lg font-medium text-sm min-h-[44px]
-              hover:bg-blue-500 transition-colors
-              disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            Send
-          </button>
-        </div>
-      </footer>
+      ) : (
+        <>
+          {/* Messages */}
+          <main className="flex-1 overflow-y-auto px-2 py-4 sm:px-4">
+            {messages.length === 0 && !streamingChatMsg && (
+              <p className="text-gray-500 text-center mt-20">Send a message to get started</p>
+            )}
+            {messages.map((msg, i) => (
+              <MessageRenderer key={i} msg={msg} />
+            ))}
+            {streamingChatMsg && (
+              <MessageRenderer msg={streamingChatMsg} />
+            )}
+            <div ref={bottomRef} />
+          </main>
+
+          {/* Input */}
+          <footer className="px-2 py-2 sm:px-4 sm:py-4 border-t border-gray-200 dark:border-gray-700 shrink-0 pb-[env(safe-area-inset-bottom,8px)]">
+            {/* T-36: Quick command panel — mobile only */}
+            <QuickCommands
+              onCommand={(cmd) => {
+                if (!wsRef.current || status !== 'connected') return
+                const msg: ChatMessage = {
+                  type: 'user',
+                  message: { role: 'user', content: cmd },
+                  parent_tool_use_id: null,
+                  session_id: '',
+                }
+                // B-01: No local echo — let server replay add the message
+                wsRef.current.send(msg)
+              }}
+            />
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                onCompositionStart={() => { isComposingRef.current = true }}
+                onCompositionEnd={() => { isComposingRef.current = false }}
+                placeholder={status === 'connected' ? 'Type a message...' : 'Waiting for connection...'}
+                disabled={status !== 'connected'}
+                className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white p-3 rounded-lg outline-none
+                  focus:ring-2 focus:ring-blue-500 min-h-[44px] text-base
+                  disabled:opacity-50 disabled:cursor-not-allowed"
+              />
+              <button
+                onClick={sendMessage}
+                disabled={status !== 'connected' || !input.trim()}
+                className="px-4 py-3 bg-blue-600 rounded-lg font-medium text-sm min-h-[44px]
+                  hover:bg-blue-500 transition-colors
+                  disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Send
+              </button>
+            </div>
+          </footer>
+        </>
+      )}
 
       {/* T-19: Permission dialog — show first pending request */}
       {pendingPerms.size > 0 && (() => {
