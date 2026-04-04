@@ -625,7 +625,7 @@ export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
     case 'user':
       return (
         <div className="flex justify-end mb-4">
-          <div className="bg-blue-600 rounded-2xl rounded-br-md px-4 py-2 max-w-[85%] sm:max-w-[70%]">
+          <div className="bg-gray-200 dark:bg-blue-600 text-gray-900 dark:text-white rounded-2xl rounded-br-md px-4 py-2 max-w-[85%] sm:max-w-[70%]">
             <p className="text-sm whitespace-pre-wrap break-words overflow-x-auto">
               {typeof msg.message?.content === 'string'
                 ? msg.message.content
