@@ -237,7 +237,11 @@ export function connectWs(baseUrl: string) {
       clearReconnectTimer()
       reconnectAttempts = 0
       if (ws) {
+        // Fully detach old socket to prevent late events
+        ws.onopen = null
         ws.onclose = null
+        ws.onmessage = null
+        ws.onerror = null
         ws.close()
         ws = null
       }

@@ -334,7 +334,13 @@ export default function App() {
         <span className="font-mono text-sm">{statusLabel}</span>
         {status === 'disconnected' && (
           <button
-            onClick={() => wsRef.current?.reconnect()}
+            onClick={() => {
+              // Reset stale UI state from previous session
+              setStreamingMsg(null)
+              setPendingPerms(new Map())
+              streamStateRef.current.reset()
+              wsRef.current?.reconnect()
+            }}
             className="ml-1 px-2 py-0.5 text-xs rounded bg-blue-600 text-white hover:bg-blue-500 transition-colors"
           >
             Reconnect
