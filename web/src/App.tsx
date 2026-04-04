@@ -151,7 +151,16 @@ export default function App() {
       }
 
       // B-01: User message replay from server — add to messages list
+      // B-08: Skip tool_result messages disguised as user messages
       if (d.type === 'user') {
+        const msg = d as Record<string, unknown>
+        const content = (msg.message as Record<string, unknown>)?.content
+        // If content is an array containing tool_result, skip (not a real user message)
+        if (Array.isArray(content) && content.some((b: unknown) =>
+          typeof b === 'object' && b !== null && (b as Record<string, unknown>).type === 'tool_result'
+        )) {
+          return
+        }
         setMessages((prev) => [...prev, data as ChatMessage])
         return
       }
