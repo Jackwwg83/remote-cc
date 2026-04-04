@@ -105,3 +105,4 @@
 - [ ] B-05: EnterPlanMode 工具调用显示 {} — 应该渲染成"进入计划模式"的状态提示，不是空 JSON
 - [ ] B-06: 主题切换 — Web UI 加深色/浅色模式切换按钮，默认跟随系统 prefers-color-scheme，可手动切换并 localStorage 持久化
 - [ ] B-07: 权限弹窗缺 "Always Allow" — 原版有三个选项：Allow / Always Allow / Deny。Always Allow 通过 control_response 的 updatedPermissions 字段传递权限规则，Claude 会持久化。参考 rdcc PermissionPromptToolResultSchema.ts 的 updatedPermissions 字段
+- [ ] B-08: tool_result 在 user replay 消息里显示为蓝色气泡 — user replay 消息的 content 如果是 tool_result 数组，不应该显示为普通文字气泡，应该跳过或格式化显示
