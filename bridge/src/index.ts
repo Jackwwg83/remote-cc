@@ -40,6 +40,8 @@ const { values: args } = parseArgs({
     local: { type: 'boolean', default: true },
     help: { type: 'boolean', short: 'h' },
     version: { type: 'boolean', short: 'v' },
+    continue: { type: 'boolean', short: 'c' },
+    resume: { type: 'string' },
   },
 })
 
@@ -56,11 +58,13 @@ Usage:
   remote-cc [options]
 
 Options:
-  --port, -p <port>    WebSocket server port (default: 7860)
-  --relay, -r <url>    Connect to a relay server (V2, not yet implemented)
-  --local              Direct connect mode via Tailscale (default)
-  --help, -h           Show this help
-  --version, -v        Show version
+  --port, -p <port>       Server port (default: 7860)
+  --continue, -c          Resume the most recent session
+  --resume <session-id>   Resume a specific session by ID
+  --relay, -r <url>       Connect to a relay server (V2, not yet implemented)
+  --local                 Direct connect mode via Tailscale (default)
+  --help, -h              Show this help
+  --version, -v           Show version
   `)
   process.exit(0)
 }
@@ -270,14 +274,44 @@ async function main() {
   }
 
   // -----------------------------------------------------------------------
-  // 9. Broadcast initial "waiting_for_session" status
+  // 9. Handle --continue / --resume auto-start, or broadcast waiting status
   // -----------------------------------------------------------------------
-  console.log('   Bridge started — waiting for session start via web UI')
-  ws.broadcast(JSON.stringify({
-    type: 'system',
-    subtype: 'session_status',
-    state: 'waiting_for_session',
-  }))
+  if (args.continue) {
+    // Auto-start: find most recent session and spawn with --continue
+    const sessions = await scanSessions()
+    if (sessions.length === 0) {
+      console.log('   No existing sessions found. Starting new session...')
+      await pm.start(process.cwd(), { mode: 'new' })
+    } else {
+      const latest = sessions[0] // sorted desc by time
+      console.log(`   Continuing session: ${latest.shortId} (${latest.project})`)
+      await pm.start(latest.cwd, { mode: 'continue' })
+    }
+    // wireSession is called via onSessionStarted callback
+  } else if (args.resume) {
+    // Auto-start: find session by ID and spawn with --resume
+    const sessions = await scanSessions()
+    const target = sessions.find(s => s.id === args.resume || s.shortId === args.resume)
+    if (!target) {
+      console.error(`   Session not found: ${args.resume}`)
+      console.error('   Available sessions:')
+      sessions.slice(0, 5).forEach(s => {
+        console.error(`     ${s.shortId}  ${s.project}  ${s.summary.slice(0, 50)}`)
+      })
+      process.exit(1)
+    }
+    console.log(`   Resuming session: ${target.shortId} (${target.project})`)
+    await pm.start(target.cwd, { mode: 'resume', sessionId: target.id })
+    // wireSession is called via onSessionStarted callback
+  } else {
+    // Default: wait for web UI POST /sessions/start
+    console.log('   Bridge started — waiting for session start via web UI')
+    ws.broadcast(JSON.stringify({
+      type: 'system',
+      subtype: 'session_status',
+      state: 'waiting_for_session',
+    }))
+  }
 }
 
 main().catch(err => {
