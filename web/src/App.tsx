@@ -34,6 +34,16 @@ export default function App() {
   const reconnectedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const prevStatusRef = useRef<WsState>('disconnected')
 
+  // B-06: Dark/light theme toggle
+  const [theme, setTheme] = useState(() =>
+    localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+  )
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark')
+    localStorage.setItem('theme', theme)
+  }, [theme])
+
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [streamingMsg, setStreamingMsg] = useState<StreamingMessage | null>(null)
   const [input, setInput] = useState('')
@@ -101,29 +111,19 @@ export default function App() {
       if (d.type === 'assistant' && d.subtype === 'partial') {
         const event = d.event as Record<string, unknown> | undefined
 
-        // message_stop: finalize streaming → move to regular messages
+        // B-02: message_stop — just clear streaming preview. The full assistant
+        // message will arrive as a separate non-partial message and be added to
+        // messages there, preventing duplicates.
         if (event?.type === 'message_stop') {
           ss.handlePartial(data)
-          const final = ss.finalize()
-          if (final) {
-            // Flush any pending rAF
-            if (rafIdRef.current) {
-              cancelAnimationFrame(rafIdRef.current)
-              rafIdRef.current = null
-            }
-            pendingUpdateRef.current = null
-            setStreamingMsg(null)
-
-            // Convert to ChatMessage format and add to messages
-            const chatMsg: ChatMessage = {
-              type: 'assistant',
-              message: {
-                role: 'assistant',
-                content: streamingToContent(final),
-              },
-            }
-            setMessages((prev) => [...prev, chatMsg])
+          ss.finalize()
+          // Flush any pending rAF
+          if (rafIdRef.current) {
+            cancelAnimationFrame(rafIdRef.current)
+            rafIdRef.current = null
           }
+          pendingUpdateRef.current = null
+          setStreamingMsg(null)
           return
         }
 
@@ -167,9 +167,13 @@ export default function App() {
       if (d.type === 'system') {
         const sub = (d as Record<string, unknown>).subtype as string
         // Skip technical messages (init, hooks, compact boundaries)
+        // B-03: Skip all technical/internal system subtypes
         const skipSubtypes = new Set([
           'init', 'hook_started', 'hook_response', 'hook_progress',
           'compact_boundary', 'microcompact_boundary',
+          'task_started', 'task_progress', 'task_notification',
+          'session_state_changed', 'files_persisted',
+          'status', 'api_retry', 'rate_limit', 'rate_limit_event',
         ])
         if (!skipSubtypes.has(sub)) {
           setMessages((prev) => [...prev, data as ChatMessage])
@@ -219,10 +223,8 @@ export default function App() {
       session_id: '',
     }
 
-    // Show locally immediately
-    setMessages((prev) => [...prev, msg])
-
-    // Send SDKUserMessage over WebSocket
+    // B-01: No local echo — user messages are added only when replayed from
+    // the server via WebSocket, preventing duplicates.
     wsRef.current.send(msg)
     setInput('')
   }, [input])
@@ -245,6 +247,25 @@ export default function App() {
           subtype: 'success',
           request_id: action.requestId,
           response: { behavior: 'allow', updatedInput: {} },
+        },
+      })
+    } else if (action.behavior === 'always_allow') {
+      // B-07: Always Allow — send allow + permission rule for this tool
+      wsRef.current.send({
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: action.requestId,
+          response: {
+            behavior: 'allow',
+            updatedInput: {},
+            updatedPermissions: [{
+              type: 'addRules',
+              rules: [{ toolName: action.toolName }],
+              behavior: 'allow',
+              destination: 'localSettings',
+            }],
+          },
         },
       })
     } else {
@@ -290,12 +311,20 @@ export default function App() {
     : 'Disconnected'
 
   return (
-    <div className="h-dvh bg-gray-900 text-white flex flex-col">
+    <div className="h-dvh bg-white dark:bg-gray-900 text-gray-900 dark:text-white flex flex-col">
       {/* Header */}
-      <header className="p-4 border-b border-gray-700 flex items-center gap-2 shrink-0">
+      <header className="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center gap-2 shrink-0">
         <span className={`w-2 h-2 rounded-full ${statusColor}`} />
         <span className="font-mono text-sm">{statusLabel}</span>
-        <span className="ml-auto text-xs text-gray-500">remote-cc v0.1.0</span>
+        {/* B-06: Theme toggle */}
+        <button
+          onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+          className="ml-auto p-1.5 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors text-lg"
+          title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+        >
+          {theme === 'dark' ? '\u2600\uFE0F' : '\uD83C\uDF19'}
+        </button>
+        <span className="text-xs text-gray-500">remote-cc v0.1.0</span>
       </header>
 
       {/* T-34: Reconnecting banner */}
@@ -327,7 +356,7 @@ export default function App() {
       </main>
 
       {/* Input */}
-      <footer className="px-2 py-2 sm:px-4 sm:py-4 border-t border-gray-700 shrink-0 pb-[env(safe-area-inset-bottom,8px)]">
+      <footer className="px-2 py-2 sm:px-4 sm:py-4 border-t border-gray-200 dark:border-gray-700 shrink-0 pb-[env(safe-area-inset-bottom,8px)]">
         {/* T-36: Quick command panel — mobile only */}
         <QuickCommands
           onCommand={(cmd) => {
@@ -338,7 +367,7 @@ export default function App() {
               parent_tool_use_id: null,
               session_id: '',
             }
-            setMessages((prev) => [...prev, msg])
+            // B-01: No local echo — let server replay add the message
             wsRef.current.send(msg)
           }}
         />
@@ -350,7 +379,7 @@ export default function App() {
             onKeyDown={handleKeyDown}
             placeholder={status === 'connected' ? 'Type a message...' : 'Waiting for connection...'}
             disabled={status !== 'connected'}
-            className="flex-1 bg-gray-800 text-white p-3 rounded-lg outline-none
+            className="flex-1 bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white p-3 rounded-lg outline-none
               focus:ring-2 focus:ring-blue-500 min-h-[44px] text-base
               disabled:opacity-50 disabled:cursor-not-allowed"
           />

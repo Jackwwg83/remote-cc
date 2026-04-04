@@ -40,7 +40,9 @@ export interface PermissionRequest {
 
 export interface PermissionAction {
   requestId: string
-  behavior: 'allow' | 'deny'
+  behavior: 'allow' | 'deny' | 'always_allow'
+  /** Tool name — needed for "always allow" to create a permission rule */
+  toolName?: string
 }
 
 // --- Input display logic ---
@@ -118,7 +120,7 @@ export default function PermissionDialog({ request, onRespond }: Props) {
           </div>
         </div>
 
-        {/* Action buttons — T-20 */}
+        {/* Action buttons — T-20 / B-07 */}
         <div className="px-5 pb-5 flex gap-3">
           <button
             onClick={() => onRespond({ requestId: request_id, behavior: 'allow' })}
@@ -127,6 +129,14 @@ export default function PermissionDialog({ request, onRespond }: Props) {
               focus:outline-none focus:ring-2 focus:ring-green-400"
           >
             Allow
+          </button>
+          <button
+            onClick={() => onRespond({ requestId: request_id, behavior: 'always_allow', toolName: req.tool_name })}
+            className="flex-1 min-h-[48px] rounded-lg bg-blue-600 text-white font-semibold text-sm
+              hover:bg-blue-500 active:bg-blue-700 transition-colors
+              focus:outline-none focus:ring-2 focus:ring-blue-400"
+          >
+            Always Allow
           </button>
           <button
             onClick={() => onRespond({ requestId: request_id, behavior: 'deny' })}

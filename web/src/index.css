@@ -1,5 +1,8 @@
 @import "tailwindcss";
 
+/* B-06: Enable class-based dark mode for manual toggle */
+@custom-variant dark (&:where(.dark, .dark *));
+
 /* T-35: Touch-friendly interactive elements on mobile */
 @media (max-width: 639px) {
   main button,

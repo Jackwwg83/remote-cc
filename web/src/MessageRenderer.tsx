@@ -65,17 +65,67 @@ function formatToolParams(name: string, input: unknown): { display: string; isMo
   return { display: JSON.stringify(params, null, 2), isMono: false }
 }
 
+// B-04: AskUserQuestion card — render questions with option buttons
+function AskUserQuestionCard({ questions }: {
+  questions: Array<{ question: string; options: Array<{ label: string; description?: string }> }>
+}) {
+  return (
+    <div className="bg-blue-50 dark:bg-blue-950/30 rounded-lg p-4 my-2 border border-blue-300 dark:border-blue-700/40 space-y-4">
+      {questions.map((q, qi) => (
+        <div key={qi}>
+          <p className="text-sm font-medium text-blue-800 dark:text-blue-200 mb-2">{q.question}</p>
+          <div className="flex flex-wrap gap-2">
+            {q.options.map((opt, oi) => (
+              <button
+                key={oi}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium
+                  bg-blue-100 dark:bg-blue-600/20 text-blue-700 dark:text-blue-300
+                  hover:bg-blue-200 dark:hover:bg-blue-600/40 transition-colors border border-blue-300 dark:border-blue-600/30 cursor-default"
+                title={opt.description}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// B-05: Friendly label map for tools with empty input
+const TOOL_STATUS_LABELS: Record<string, string> = {
+  EnterPlanMode: 'Entering plan mode...',
+  ExitPlanMode: 'Exiting plan mode...',
+}
+
 function ToolUseBlock({ name, input }: { name: string; input: unknown }) {
   const { display, isMono } = useMemo(() => formatToolParams(name, input), [name, input])
 
+  // B-04: Render AskUserQuestion as interactive card
+  if (name === 'AskUserQuestion') {
+    const questions = (input as Record<string, unknown>)?.questions as
+      Array<{ question: string; options: Array<{ label: string; description?: string }> }> | undefined
+    if (questions && Array.isArray(questions)) {
+      return <AskUserQuestionCard questions={questions} />
+    }
+  }
+
+  // B-05: Tools with empty input — show clean status label
+  const params = input as Record<string, unknown> | null
+  if (!params || Object.keys(params).length === 0) {
+    const label = TOOL_STATUS_LABELS[name] || `${name}...`
+    return <div className="text-gray-500 italic text-sm my-2">{label}</div>
+  }
+
   return (
-    <div className="bg-gray-800 rounded-lg p-3 my-2 border border-gray-700">
-      <div className="flex items-center gap-2 text-sm text-gray-400">
+    <div className="bg-gray-100 dark:bg-gray-800 rounded-lg p-3 my-2 border border-gray-200 dark:border-gray-700">
+      <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
         <span>🔧</span>
         <span className="font-mono">{name}</span>
       </div>
       {display && (
-        <pre className={`mt-2 text-xs bg-gray-900 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all ${
+        <pre className={`mt-2 text-xs bg-gray-200 dark:bg-gray-900 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all ${
           isMono ? 'font-mono' : ''
         }`}>
           {display}
