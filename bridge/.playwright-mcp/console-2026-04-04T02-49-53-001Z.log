@@ -1,0 +1,4 @@
+[     102ms] TypeError: Cannot read properties of undefined (reading '0')
+    at draw (http://localhost:8787/tetris.html:306:16)
+    at http://localhost:8787/tetris.html:429:1
+[     117ms] [ERROR] Failed to load resource: the server responded with a status of 404 (File not found) @ http://localhost:8787/favicon.ico:0

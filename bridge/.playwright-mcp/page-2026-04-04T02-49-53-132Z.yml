@@ -1,0 +1,21 @@
+- generic [ref=e2]:
+  - generic [ref=e6]:
+    - heading "俄罗斯方块" [level=1] [ref=e7]
+    - paragraph [ref=e8]: 按任意键开始
+  - generic [ref=e9]:
+    - generic [ref=e10]:
+      - heading "分数" [level=3] [ref=e11]
+      - generic [ref=e12]: "0"
+    - generic [ref=e13]:
+      - heading "等级" [level=3] [ref=e14]
+      - generic [ref=e15]: "1"
+    - generic [ref=e16]:
+      - heading "行数" [level=3] [ref=e17]
+      - generic [ref=e18]: "0"
+    - heading "下一个" [level=3] [ref=e20]
+    - generic [ref=e22]:
+      - text: ←→ 移动
+      - text: ↑ 旋转
+      - text: ↓ 加速
+      - text: Space 硬降
+      - text: P 暂停

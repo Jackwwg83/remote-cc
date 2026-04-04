@@ -93,3 +93,13 @@
 - [ ] T-36: 快捷命令面板 — /clear /compact /cost /model
 - [ ] T-37: thinking 折叠 — details/summary
 - [ ] T-38: claude 版本兼容检测 — bridge 启动时 `claude --version` 对比已知兼容版本
+
+---
+
+## Bug fixes（真实浏览器测试发现）
+
+- [ ] B-01: 用户消息重复 — 本地 echo + --replay-user-messages 回传导致显示两遍。需要去重：要么去掉本地 echo 只用 replay，要么过滤 replay
+- [ ] B-02: Claude 回复重复 — streaming partial 累积的完整消息 + 最终 assistant 消息都加进了列表。需要在收到完整 assistant 时替换（不是追加）streaming 的那条
+- [ ] B-03: system.status JSON 暴露 — subtype=status 的消息没被过滤，显示了 raw JSON。需要加到 skipSubtypes 或者格式化显示
+- [ ] B-04: AskUserQuestion 工具调用显示 raw JSON — 应该渲染成交互式选择 UI（选项按钮），用户点选后发回 tool_result
+- [ ] B-05: EnterPlanMode 工具调用显示 {} — 应该渲染成"进入计划模式"的状态提示，不是空 JSON
