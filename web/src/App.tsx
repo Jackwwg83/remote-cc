@@ -10,7 +10,11 @@ import QuickCommands from './QuickCommands'
 
 function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search)
-  const base = params.get('ws') ?? 'ws://localhost:7860'
+  // Infer WS URL from current page location (same host:port, ws:// protocol)
+  const loc = window.location
+  const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:'
+  const defaultWs = `${wsProtocol}//${loc.host}`
+  const base = params.get('ws') ?? defaultWs
   // Pass the auth token from page URL to WebSocket URL as a query parameter,
   // since browser WebSocket cannot set custom headers.
   const token = params.get('token')
@@ -159,10 +163,31 @@ export default function App() {
         return
       }
 
-      // Other chat message types
-      const chatTypes = new Set(['system', 'result'])
-      if (chatTypes.has(d.type as string)) {
-        setMessages((prev) => [...prev, data as ChatMessage])
+      // Filter: only show user-visible system messages
+      if (d.type === 'system') {
+        const sub = (d as Record<string, unknown>).subtype as string
+        // Skip technical messages (init, hooks, compact boundaries)
+        const skipSubtypes = new Set([
+          'init', 'hook_started', 'hook_response', 'hook_progress',
+          'compact_boundary', 'microcompact_boundary',
+        ])
+        if (!skipSubtypes.has(sub)) {
+          setMessages((prev) => [...prev, data as ChatMessage])
+        }
+        return
+      }
+
+      // Result message: show as status, not raw JSON
+      if (d.type === 'result') {
+        const result = d as Record<string, unknown>
+        const text = (result.result as string) || (result.subtype === 'success' ? 'Completed' : 'Error')
+        setMessages((prev) => [...prev, {
+          type: 'system',
+          subtype: 'status',
+          text,
+          _original: data,
+        } as unknown as ChatMessage])
+        return
       }
     })
 
