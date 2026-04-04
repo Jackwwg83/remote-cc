@@ -47,6 +47,7 @@ export const CLAUDE_ARGS = [
   '--print',
   '--input-format', 'stream-json',
   '--output-format', 'stream-json',
+  '--permission-prompt-tool', 'stdio',
   '--verbose',
   '--include-partial-messages',
   '--include-hook-events',
