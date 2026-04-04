@@ -37,6 +37,13 @@ export interface SessionInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/** Number of lines to read from the head of each .jsonl file. */
+const SESSION_HEAD_LINES = 10
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -71,12 +78,14 @@ function makeShortId(uuid: string): string {
 async function readFirstLines(filePath: string, maxLines: number): Promise<string[]> {
   const lines: string[] = []
 
-  // Verify file is accessible before creating streams
-  await stat(filePath)
-
   await new Promise<void>((resolve, reject) => {
+    let settled = false
     const stream = createReadStream(filePath, { encoding: 'utf8' })
     const rl = createInterface({ input: stream, crlfDelay: Infinity })
+
+    const settle = (fn: () => void) => {
+      if (!settled) { settled = true; fn() }
+    }
 
     rl.on('line', (line) => {
       lines.push(line)
@@ -86,9 +95,9 @@ async function readFirstLines(filePath: string, maxLines: number): Promise<strin
       }
     })
 
-    rl.on('close', resolve)
-    rl.on('error', reject)
-    stream.on('error', reject)
+    rl.on('close', () => settle(resolve))
+    rl.on('error', (err) => settle(() => reject(err)))
+    stream.on('error', (err) => settle(() => reject(err)))
   })
 
   return lines
@@ -112,7 +121,7 @@ async function parseSessionFile(
   let lines: string[]
 
   try {
-    lines = await readFirstLines(filePath, 10)
+    lines = await readFirstLines(filePath, SESSION_HEAD_LINES)
   } catch {
     // Unreadable or permission error — skip
     return null
@@ -223,10 +232,8 @@ export async function scanSessions(projectDir?: string): Promise<SessionInfo[]> 
     .flat()
     .filter((s): s is SessionInfo => s !== null)
 
-  sessions.sort((a, b) => {
-    // Descending: most recent first
-    return new Date(b.time).getTime() - new Date(a.time).getTime()
-  })
+  // ISO 8601 strings from toISOString() sort lexicographically (all UTC)
+  sessions.sort((a, b) => b.time.localeCompare(a.time))
 
   return sessions
 }
@@ -244,7 +251,8 @@ async function scanProjectDir(dir: string): Promise<SessionInfo[]> {
     return []
   }
 
-  // The fallback cwd decoded from the directory name
+  // NOTE: fallbackCwd may be inaccurate for paths with hyphens.
+  // The real cwd is extracted from session content when available.
   const fallbackCwd = decodeDirName(basename(dir))
 
   // Process all .jsonl files in this directory in parallel
