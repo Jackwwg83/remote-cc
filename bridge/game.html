@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snake Game</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    font-family: 'Segoe UI', sans-serif;
+    color: #eee;
+  }
+  #wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+  #hud {
+    width: 400px;
+    display: flex;
+    justify-content: space-between;
+    font-size: 18px;
+  }
+  canvas {
+    border: 2px solid #0f3460;
+    border-radius: 4px;
+    background: #16213e;
+  }
+  #msg {
+    font-size: 16px;
+    height: 20px;
+    color: #e94560;
+  }
+</style>
+</head>
+<body>
+<div id="wrapper">
+  <div id="hud">
+    <span>Score: <strong id="score">0</strong></span>
+    <span>Best: <strong id="best">0</strong></span>
+  </div>
+  <canvas id="c" width="400" height="400"></canvas>
+  <div id="msg">Press any arrow key to start</div>
+</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('score');
+const bestEl = document.getElementById('best');
+const msgEl = document.getElementById('msg');
+
+const CELL = 20;
+const COLS = canvas.width / CELL;
+const ROWS = canvas.height / CELL;
+const TICK = 100;
+
+let snake, dir, nextDir, food, score, best = 0, running, gameOver;
+
+function init() {
+  const mid = Math.floor(ROWS / 2);
+  snake = [{ x: 5, y: mid }, { x: 4, y: mid }, { x: 3, y: mid }];
+  dir = { x: 1, y: 0 };
+  nextDir = { x: 1, y: 0 };
+  score = 0;
+  running = false;
+  gameOver = false;
+  scoreEl.textContent = '0';
+  msgEl.textContent = 'Press any arrow key to start';
+  placeFood();
+  draw();
+}
+
+function placeFood() {
+  let pos;
+  do {
+    pos = { x: Math.floor(Math.random() * COLS), y: Math.floor(Math.random() * ROWS) };
+  } while (snake.some(s => s.x === pos.x && s.y === pos.y));
+  food = pos;
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // grid lines
+  ctx.strokeStyle = '#1a1a3e';
+  for (let i = 0; i <= COLS; i++) {
+    ctx.beginPath(); ctx.moveTo(i * CELL, 0); ctx.lineTo(i * CELL, canvas.height); ctx.stroke();
+  }
+  for (let i = 0; i <= ROWS; i++) {
+    ctx.beginPath(); ctx.moveTo(0, i * CELL); ctx.lineTo(canvas.width, i * CELL); ctx.stroke();
+  }
+
+  // food
+  ctx.fillStyle = '#e94560';
+  ctx.beginPath();
+  ctx.arc(food.x * CELL + CELL / 2, food.y * CELL + CELL / 2, CELL / 2 - 2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // snake
+  snake.forEach((seg, i) => {
+    ctx.fillStyle = i === 0 ? '#53d8fb' : '#0f3460';
+    ctx.fillRect(seg.x * CELL + 1, seg.y * CELL + 1, CELL - 2, CELL - 2);
+    if (i === 0) {
+      ctx.fillStyle = '#16213e';
+      const ex = dir.x === 0 ? 4 : (dir.x > 0 ? 10 : 4);
+      const ey = dir.y === 0 ? 4 : (dir.y > 0 ? 10 : 4);
+      ctx.fillRect(seg.x * CELL + ex, seg.y * CELL + ey, 3, 3);
+      ctx.fillRect(seg.x * CELL + ex + (dir.x === 0 ? 6 : 0), seg.y * CELL + ey + (dir.y === 0 ? 6 : 0), 3, 3);
+    }
+  });
+}
+
+function update() {
+  if (!running || gameOver) return;
+
+  dir = { ...nextDir };
+  const head = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
+
+  // wall collision
+  if (head.x < 0 || head.x >= COLS || head.y < 0 || head.y >= ROWS) return die();
+  // self collision
+  if (snake.some(s => s.x === head.x && s.y === head.y)) return die();
+
+  snake.unshift(head);
+
+  if (head.x === food.x && head.y === food.y) {
+    score++;
+    scoreEl.textContent = score;
+    placeFood();
+  } else {
+    snake.pop();
+  }
+
+  draw();
+}
+
+function die() {
+  gameOver = true;
+  running = false;
+  if (score > best) {
+    best = score;
+    bestEl.textContent = best;
+  }
+  msgEl.textContent = `Game Over! Score: ${score}. Press any arrow key to restart.`;
+  draw();
+
+  // flash the snake red
+  ctx.fillStyle = 'rgba(233, 69, 96, 0.4)';
+  snake.forEach(s => ctx.fillRect(s.x * CELL, s.y * CELL, CELL, CELL));
+}
+
+document.addEventListener('keydown', e => {
+  const keys = { ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 }, ArrowLeft: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 } };
+  const d = keys[e.key];
+  if (!d) return;
+  e.preventDefault();
+
+  if (gameOver) { init(); return; }
+
+  // prevent reverse
+  if (d.x + dir.x === 0 && d.y + dir.y === 0) return;
+
+  nextDir = d;
+
+  if (!running) {
+    running = true;
+    msgEl.textContent = '';
+    setInterval(update, TICK);
+  }
+});
+
+init();
+</script>
+</body>
+</html>

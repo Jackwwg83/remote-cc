@@ -332,6 +332,14 @@ export default function App() {
       <header className="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center gap-2 shrink-0">
         <span className={`w-2 h-2 rounded-full ${statusColor}`} />
         <span className="font-mono text-sm">{statusLabel}</span>
+        {status === 'disconnected' && (
+          <button
+            onClick={() => wsRef.current?.reconnect()}
+            className="ml-1 px-2 py-0.5 text-xs rounded bg-blue-600 text-white hover:bg-blue-500 transition-colors"
+          >
+            Reconnect
+          </button>
+        )}
         {/* B-06: Theme toggle */}
         <button
           onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
