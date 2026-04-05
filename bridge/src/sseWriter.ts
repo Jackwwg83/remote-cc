@@ -7,7 +7,7 @@
  * - Authenticates clients via ?token=xxx query param
  * - Replays missed messages on reconnect via Last-Event-ID / ?from_seq=N
  * - Broadcasts sequenced claude output messages and session status events
- * - Sends keepalive comments every 15 s to prevent proxy timeouts
+ * - Sends keepalive events every 15 s to prevent proxy timeouts
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -60,7 +60,7 @@ export interface SseWriterDeps {
  * The SSE frame format is:
  *   - Sequenced message:  id:<seq>\nevent:message\ndata:<json>\n\n
  *   - Status event:       event:session_status\ndata:<json>\n\n
- *   - Keepalive comment:  :keepalive\n\n
+ *   - Keepalive event:   event:keepalive\ndata:\n\n
  *
  * @param deps - Dependencies: authToken, messageCache, getSessionState
  * @returns { writer, handleSseRequest }
@@ -79,7 +79,7 @@ export function createSseWriter(deps: SseWriterDeps): {
   // -------------------------------------------------------------------------
 
   const keepaliveTimer = setInterval(() => {
-    writeToAll(':keepalive\n\n')
+    writeToAll('event:keepalive\ndata:\n\n')
   }, KEEPALIVE_INTERVAL_MS)
 
   // Prevent the timer from keeping the Node.js process alive on its own
