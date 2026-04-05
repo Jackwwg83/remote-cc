@@ -52,12 +52,18 @@ export interface HttpServerDeps {
   /** Auth token for session control endpoints. If set, these endpoints require
    *  `Authorization: Bearer <token>` header or `?token=` query parameter. */
   authToken?: string
+  /** SSE writer request handler — handles GET /events/stream */
+  sseHandler?: (req: IncomingMessage, res: ServerResponse) => void
+  /** Callback for POST /messages — returns false if no active session (→ 503) */
+  onMessageReceived?: (msg: Record<string, unknown>) => boolean
+  /** Recent message IDs for POST idempotency dedup */
+  recentMessageIds?: Set<string>
 }
 
 const CORS_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 }
 
 const MIME_TYPES: Record<string, string> = {
@@ -236,7 +242,12 @@ async function handleRequestAsync(
   res: ServerResponse,
   deps: HttpServerDeps,
 ): Promise<void> {
-  const { method, url } = req
+  const { method } = req
+  const rawUrl = req.url ?? '/'
+
+  // Parse URL once — use pathname for all route matching (supports query params)
+  const urlObj = new URL(rawUrl, `http://${req.headers.host ?? 'localhost'}`)
+  const pathname = urlObj.pathname
 
   // CORS preflight
   if (method === 'OPTIONS') {
@@ -251,13 +262,24 @@ async function handleRequestAsync(
   // API routes first (before static file serving)
 
   // Route: GET /health
-  if (method === 'GET' && url === '/health') {
+  if (method === 'GET' && pathname === '/health') {
     sendJson(res, 200, { ok: true, version: VERSION })
     return
   }
 
+  // Route: GET /events/stream — SSE transport
+  if (method === 'GET' && pathname === '/events/stream') {
+    if (!deps.sseHandler) {
+      sendJson(res, 503, { error: 'SSE not available' })
+      return
+    }
+    // Auth is handled inside sseHandler (it checks ?token)
+    deps.sseHandler(req, res)
+    return
+  }
+
   // Route: GET /sessions/history — list all scannable sessions
-  if (method === 'GET' && url === '/sessions/history') {
+  if (method === 'GET' && pathname === '/sessions/history') {
     if (!checkAuth(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
@@ -272,7 +294,7 @@ async function handleRequestAsync(
   }
 
   // Route: GET /sessions — alias for /sessions/history (backward compat)
-  if (method === 'GET' && url === '/sessions') {
+  if (method === 'GET' && pathname === '/sessions') {
     if (!checkAuth(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
@@ -287,7 +309,7 @@ async function handleRequestAsync(
   }
 
   // Route: GET /sessions/status — current process state
-  if (method === 'GET' && url === '/sessions/status') {
+  if (method === 'GET' && pathname === '/sessions/status') {
     if (!checkAuth(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
@@ -304,8 +326,57 @@ async function handleRequestAsync(
     return
   }
 
+  // Route: POST /messages — receive client messages for SSE transport
+  if (method === 'POST' && pathname === '/messages') {
+    if (!checkAuth(req, deps.authToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
+
+    // Parse body
+    let body: Record<string, unknown>
+    try {
+      body = await readJsonBody(req)
+    } catch (err) {
+      sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+      return
+    }
+
+    // Idempotency check: if _messageId is present and already seen, return 200 silently
+    const messageId = body._messageId as string | undefined
+    if (messageId && deps.recentMessageIds?.has(messageId)) {
+      sendJson(res, 200, { ok: true, deduplicated: true })
+      return
+    }
+
+    // Forward to claude
+    if (!deps.onMessageReceived) {
+      sendJson(res, 503, { error: 'No message handler registered' })
+      return
+    }
+
+    const ok = deps.onMessageReceived(body)
+    if (!ok) {
+      sendJson(res, 503, { error: 'No active session' })
+      return
+    }
+
+    // Track message ID for dedup
+    if (messageId && deps.recentMessageIds) {
+      deps.recentMessageIds.add(messageId)
+      // Prune old IDs (keep last 100)
+      if (deps.recentMessageIds.size > 100) {
+        const first = deps.recentMessageIds.values().next().value
+        if (first) deps.recentMessageIds.delete(first)
+      }
+    }
+
+    sendJson(res, 200, { ok: true })
+    return
+  }
+
   // Route: POST /sessions/start — start a new or resumed session
-  if (method === 'POST' && url === '/sessions/start') {
+  if (method === 'POST' && pathname === '/sessions/start') {
     if (!checkAuth(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
@@ -375,7 +446,7 @@ async function handleRequestAsync(
   }
 
   // Route: POST /sessions/stop — stop the current process
-  if (method === 'POST' && url === '/sessions/stop') {
+  if (method === 'POST' && pathname === '/sessions/stop') {
     if (!checkAuth(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
@@ -391,21 +462,18 @@ async function handleRequestAsync(
   }
 
   // Static file serving for GET requests
-  if (method === 'GET' && url) {
-    // Strip query string for file path resolution
-    const urlPath = url.split('?')[0]
-
+  if (method === 'GET') {
     // Try to serve from web/dist/
-    if (tryServeStatic(urlPath, res)) return
+    if (tryServeStatic(pathname, res)) return
 
     // SPA fallback: for paths that don't match a file, serve index.html
     // (lets client-side routing work if we add it later)
-    if (urlPath !== '/' && !extname(urlPath) && WEB_DIST_EXISTS) {
+    if (pathname !== '/' && !extname(pathname) && WEB_DIST_EXISTS) {
       if (tryServeStatic('/', res)) return
     }
 
     // No dist dir — show placeholder
-    if (url === '/' || url.startsWith('/?')) {
+    if (pathname === '/') {
       sendHtml(res, 200, PLACEHOLDER_HTML)
       return
     }
