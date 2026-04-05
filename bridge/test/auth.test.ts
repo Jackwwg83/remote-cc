@@ -1,25 +1,18 @@
 /**
- * Tests for auth.ts — token generation and WebSocket authentication
+ * Tests for auth.ts — token generation and verifyClient logic
  *
  * Strategy:
  * - Test generateToken() format and uniqueness
  * - Test createVerifyClient() with correct/incorrect/missing tokens
- * - Integration test: WS server with verifyClient rejects unauthorized connections
+ * Note: WS integration tests removed (wsServer replaced by sseWriter in T-S05)
  */
 
-import { describe, it, expect, afterEach } from 'vitest'
-import { createServer, type Server as HttpServer } from 'node:http'
-import WebSocket from 'ws'
+import { describe, it, expect } from 'vitest'
 import { generateToken, createVerifyClient } from '../src/auth.js'
-import { createWsServer, type WsServer } from '../src/wsServer.js'
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function tick(ms = 50): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
 
 // ---------------------------------------------------------------------------
 // Tests: generateToken
@@ -212,184 +205,4 @@ describe('createVerifyClient', () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// Tests: Integration with WsServer
-// ---------------------------------------------------------------------------
-
-describe('auth + wsServer integration', () => {
-  let httpServer: HttpServer
-  let wsServer: WsServer
-  const openClients: WebSocket[] = []
-
-  afterEach(async () => {
-    for (const ws of openClients) {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close()
-      }
-    }
-    openClients.length = 0
-
-    if (wsServer) wsServer.close()
-    await new Promise<void>((resolve) => {
-      if (httpServer) {
-        httpServer.close(() => resolve())
-      } else {
-        resolve()
-      }
-    })
-  })
-
-  function createTestServer(token: string): Promise<{
-    httpServer: HttpServer
-    wsServer: WsServer
-    port: number
-    url: string
-  }> {
-    return new Promise((resolve) => {
-      const http = createServer()
-      const ws = createWsServer(http, {
-        verifyClient: createVerifyClient(token),
-      })
-
-      http.listen(0, '127.0.0.1', () => {
-        const addr = http.address()
-        const port = typeof addr === 'object' && addr !== null ? addr.port : 0
-        resolve({
-          httpServer: http,
-          wsServer: ws,
-          port,
-          url: `ws://127.0.0.1:${port}`,
-        })
-      })
-    })
-  }
-
-  it('should accept connection with valid token in Authorization header', async () => {
-    const token = 'rcc_valid-test-token'
-    const env = await createTestServer(token)
-    httpServer = env.httpServer
-    wsServer = env.wsServer
-
-    const ws = await new Promise<WebSocket>((resolve, reject) => {
-      const client = new WebSocket(env.url, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      client.on('open', () => resolve(client))
-      client.on('error', reject)
-    })
-    openClients.push(ws)
-
-    await tick()
-    expect(wsServer.clientCount()).toBe(1)
-  })
-
-  it('should reject connection with no Authorization header', async () => {
-    const token = 'rcc_valid-test-token'
-    const env = await createTestServer(token)
-    httpServer = env.httpServer
-    wsServer = env.wsServer
-
-    const result = await new Promise<'error' | 'open'>((resolve) => {
-      const client = new WebSocket(env.url)
-      client.on('open', () => {
-        openClients.push(client)
-        resolve('open')
-      })
-      client.on('error', () => resolve('error'))
-    })
-
-    expect(result).toBe('error')
-    expect(wsServer.clientCount()).toBe(0)
-  })
-
-  it('should reject connection with wrong token', async () => {
-    const token = 'rcc_valid-test-token'
-    const env = await createTestServer(token)
-    httpServer = env.httpServer
-    wsServer = env.wsServer
-
-    const result = await new Promise<'error' | 'open'>((resolve) => {
-      const client = new WebSocket(env.url, {
-        headers: { Authorization: 'Bearer rcc_wrong-token' },
-      })
-      client.on('open', () => {
-        openClients.push(client)
-        resolve('open')
-      })
-      client.on('error', () => resolve('error'))
-    })
-
-    expect(result).toBe('error')
-    expect(wsServer.clientCount()).toBe(0)
-  })
-
-  it('should allow message exchange after authenticated connection', async () => {
-    const token = 'rcc_valid-test-token'
-    const env = await createTestServer(token)
-    httpServer = env.httpServer
-    wsServer = env.wsServer
-
-    const ws = await new Promise<WebSocket>((resolve, reject) => {
-      const client = new WebSocket(env.url, {
-        headers: { Authorization: `Bearer ${token}` },
-      })
-      client.on('open', () => resolve(client))
-      client.on('error', reject)
-    })
-    openClients.push(ws)
-
-    await tick()
-
-    // Test broadcast
-    const msgPromise = new Promise<string>((resolve) => {
-      ws.on('message', (data) => resolve(data.toString('utf8')))
-    })
-    wsServer.broadcast('hello-auth')
-    const received = await msgPromise
-    expect(received).toBe('hello-auth')
-
-    // Test client → server
-    const serverReceived: string[] = []
-    wsServer.onMessage((data) => serverReceived.push(data))
-    ws.send('from-client')
-    await tick()
-    expect(serverReceived).toContain('from-client')
-  })
-
-  it('should accept connection with valid token in query parameter', async () => {
-    const token = 'rcc_valid-test-token'
-    const env = await createTestServer(token)
-    httpServer = env.httpServer
-    wsServer = env.wsServer
-
-    // Browser WebSocket can't set headers, so token goes in the URL
-    const ws = await new Promise<WebSocket>((resolve, reject) => {
-      const client = new WebSocket(`${env.url}?token=${token}`)
-      client.on('open', () => resolve(client))
-      client.on('error', reject)
-    })
-    openClients.push(ws)
-
-    await tick()
-    expect(wsServer.clientCount()).toBe(1)
-  })
-
-  it('should reject connection with wrong token in query parameter', async () => {
-    const token = 'rcc_valid-test-token'
-    const env = await createTestServer(token)
-    httpServer = env.httpServer
-    wsServer = env.wsServer
-
-    const result = await new Promise<'error' | 'open'>((resolve) => {
-      const client = new WebSocket(`${env.url}?token=rcc_wrong-token`)
-      client.on('open', () => {
-        openClients.push(client)
-        resolve('open')
-      })
-      client.on('error', () => resolve('error'))
-    })
-
-    expect(result).toBe('error')
-    expect(wsServer.clientCount()).toBe(0)
-  })
-})
+// Note: WS integration tests removed. SSE auth is tested in sseWriter.test.ts (T-S06).
