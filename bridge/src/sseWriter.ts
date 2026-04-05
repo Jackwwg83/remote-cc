@@ -112,11 +112,11 @@ export function createSseWriter(deps: SseWriterDeps): {
    * Returns false if the write was skipped (destroyed or backpressure).
    */
   function writeToOne(res: ServerResponse, frame: string): boolean {
-    if (res.destroyed) return false
+    if (res.destroyed) { clients.delete(res); return false }
     if (res.writableLength >= BACKPRESSURE_THRESHOLD) {
-      console.warn(
-        `[sseWriter] skipping initial write (writableLength ${res.writableLength} > ${BACKPRESSURE_THRESHOLD})`,
-      )
+      console.warn(`[sseWriter] closing slow client in writeToOne (writableLength ${res.writableLength})`)
+      clients.delete(res)
+      res.end()
       return false
     }
     res.write(frame)

@@ -130,8 +130,10 @@ export function createProcessManager(): ProcessManager {
     if (state === 'spawning') {
       await spawnSettled
       // After awaiting, state could be 'running' (success) or 'idle'
-      // (spawn failed). Re-check.
-      if (state === 'idle') {
+      // (spawn failed). Re-check. Cast needed because TS narrows
+      // `state` to 'spawning' inside this block, but the await lets
+      // other code mutate `state`.
+      if ((state as ProcessState) === 'idle') {
         return
       }
     }

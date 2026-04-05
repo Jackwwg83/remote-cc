@@ -130,8 +130,8 @@ async function tryServeStatic(urlPath: string, res: ServerResponse): Promise<boo
   const filePath = urlPath === '/' ? '/index.html' : urlPath
   const fullPath = resolve(WEB_DIST_DIR, '.' + filePath)
 
-  // Security: ensure resolved path is within the dist directory
-  if (!fullPath.startsWith(WEB_DIST_DIR)) return false
+  // Security: ensure resolved path is within the dist directory (+ separator to block /dist-evil/)
+  if (!fullPath.startsWith(WEB_DIST_DIR + '/')) return false
   const ext = extname(fullPath)
   const contentType = MIME_TYPES[ext] ?? 'application/octet-stream'
 
