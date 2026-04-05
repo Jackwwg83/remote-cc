@@ -1,7 +1,7 @@
-// T-10/T-13/T-14/T-19-21/T-32-34/T-F10: Chat interface with streaming, permission approval, reconnect, session picker for remote-cc web UI
+// T-10/T-13/T-14/T-19-21/T-32-34/T-F10/T-S08: Chat interface with streaming, permission approval, reconnect, session picker for remote-cc web UI
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { connectWs, type WsState, type ReconnectMeta } from './ws'
+import { connectTransport, type TransportState, type ReconnectMeta } from './transport'
 import MessageRenderer, { type ChatMessage } from './MessageRenderer'
 import { createStreamingState, streamingToContent, type StreamingMessage } from './streamingState'
 import PermissionDialog, { type PermissionRequest, type PermissionAction } from './PermissionDialog'
@@ -22,31 +22,19 @@ export function getAuthHeaders(): Record<string, string> {
   return headers
 }
 
-function getWsUrl(): string {
-  const params = new URLSearchParams(window.location.search)
-  // Infer WS URL from current page location (same host:port, ws:// protocol)
-  const loc = window.location
-  const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:'
-  const defaultWs = `${wsProtocol}//${loc.host}`
-  const base = params.get('ws') ?? defaultWs
-  // Pass the auth token from page URL to WebSocket URL as a query parameter,
-  // since browser WebSocket cannot set custom headers.
-  const token = params.get('token')
-  if (token) {
-    const sep = base.includes('?') ? '&' : '?'
-    return `${base}${sep}token=${encodeURIComponent(token)}`
-  }
-  return base
+function getTransportUrl(): string {
+  // The transport extracts origin + token from the full page URL
+  return window.location.href
 }
 
 export default function App() {
-  const [status, setStatus] = useState<WsState>('disconnected')
+  const [status, setStatus] = useState<TransportState>('disconnected')
   // T-34: Track reconnect attempt for UI display
   const [reconnectInfo, setReconnectInfo] = useState<ReconnectMeta | null>(null)
   // T-34: "Reconnected" banner that auto-dismisses after 3s
   const [showReconnected, setShowReconnected] = useState(false)
   const reconnectedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const prevStatusRef = useRef<WsState>('disconnected')
+  const prevStatusRef = useRef<TransportState>('disconnected')
 
   // B-06: Dark/light theme toggle
   const [theme, setTheme] = useState(() =>
@@ -66,7 +54,7 @@ export default function App() {
   // T-F10: View state — show session picker or chat interface
   const [view, setView] = useState<'picker' | 'chat'>('picker')
   const bottomRef = useRef<HTMLDivElement>(null)
-  const wsRef = useRef<ReturnType<typeof connectWs> | null>(null)
+  const wsRef = useRef<ReturnType<typeof connectTransport> | null>(null)
   const streamStateRef = useRef(createStreamingState())
 
   // T-14: rAF throttling refs — survive re-renders without triggering them
@@ -90,14 +78,14 @@ export default function App() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, streamingMsg])
 
-  // Connect WebSocket on mount
+  // Connect SSE transport on mount
   useEffect(() => {
-    const ws = connectWs(getWsUrl())
-    wsRef.current = ws
+    const transport = connectTransport(getTransportUrl())
+    wsRef.current = transport
     const ss = streamStateRef.current
 
     // T-34: Handle state changes with reconnect metadata
-    ws.onStateChange((state: WsState, meta?: ReconnectMeta) => {
+    transport.onStateChange((state: TransportState, meta?: ReconnectMeta) => {
       const prev = prevStatusRef.current
       prevStatusRef.current = state
 
@@ -118,7 +106,7 @@ export default function App() {
       }
     })
 
-    ws.onMessage((data) => {
+    transport.onMessage((data) => {
       if (!data || typeof data !== 'object' || !('type' in (data as Record<string, unknown>))) return
 
       const d = data as Record<string, unknown>
@@ -246,7 +234,7 @@ export default function App() {
     })
 
     return () => {
-      ws.close()
+      transport.close()
       // Clean up rAF on unmount
       if (rafIdRef.current) {
         cancelAnimationFrame(rafIdRef.current)
@@ -260,7 +248,7 @@ export default function App() {
     }
   }, [scheduleRender])
 
-  const sendMessage = useCallback(() => {
+  const sendMessage = useCallback(async () => {
     const text = input.trim()
     if (!text || !wsRef.current) return
 
@@ -272,9 +260,12 @@ export default function App() {
     }
 
     // B-01: No local echo — user messages are added only when replayed from
-    // the server via WebSocket, preventing duplicates.
-    wsRef.current.send(msg)
-    setInput('')
+    // the server via SSE, preventing duplicates.
+    setInput('')  // Clear immediately for responsiveness
+    const ok = await wsRef.current.send(msg)
+    if (!ok) {
+      console.error('Failed to send message')
+    }
   }, [input])
 
   // IME composition guard — don't submit while composing (Chinese/Japanese/Korean input)
@@ -288,11 +279,11 @@ export default function App() {
   }
 
   // T-20: Send control_response and remove from pending
-  const handlePermission = useCallback((action: PermissionAction) => {
+  const handlePermission = useCallback(async (action: PermissionAction) => {
     if (!wsRef.current) return
 
     if (action.behavior === 'allow') {
-      wsRef.current.send({
+      await wsRef.current.send({
         type: 'control_response',
         response: {
           subtype: 'success',
@@ -302,7 +293,7 @@ export default function App() {
       })
     } else if (action.behavior === 'always_allow') {
       // B-07: Always Allow — send allow + permission rule for this tool
-      wsRef.current.send({
+      await wsRef.current.send({
         type: 'control_response',
         response: {
           subtype: 'success',
@@ -320,7 +311,7 @@ export default function App() {
         },
       })
     } else {
-      wsRef.current.send({
+      await wsRef.current.send({
         type: 'control_response',
         response: {
           subtype: 'success',
@@ -453,7 +444,7 @@ export default function App() {
           <footer className="px-2 py-2 sm:px-4 sm:py-4 border-t border-gray-200 dark:border-gray-700 shrink-0 pb-[env(safe-area-inset-bottom,8px)]">
             {/* T-36: Quick command panel — mobile only */}
             <QuickCommands
-              onCommand={(cmd) => {
+              onCommand={async (cmd) => {
                 if (!wsRef.current || status !== 'connected') return
                 const msg: ChatMessage = {
                   type: 'user',
@@ -462,7 +453,8 @@ export default function App() {
                   session_id: '',
                 }
                 // B-01: No local echo — let server replay add the message
-                wsRef.current.send(msg)
+                const ok = await wsRef.current.send(msg)
+                if (!ok) console.error('Failed to send quick command')
               }}
             />
             <div className="flex gap-2">
