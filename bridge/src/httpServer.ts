@@ -8,8 +8,8 @@
  * - Exposes session list at GET /sessions
  * - Returns 404 for unknown routes
  * - Adds CORS headers to all responses (dev convenience)
- * - The underlying http.Server supports WebSocket upgrade — the wsServer
- *   from T-05 attaches to this server for WS connections
+ * - Exposes GET /events/stream for SSE transport (via sseHandler dep)
+ * - Exposes POST /messages for client-to-server messages
  */
 
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from 'node:http'
@@ -490,8 +490,8 @@ async function handleRequestAsync(
 /**
  * Start the HTTP server on the given port.
  *
- * The returned http.Server can be passed to createWsServer() for
- * WebSocket upgrade support.
+ * The returned http.Server handles all transport (SSE via sseHandler dep,
+ * client messages via onMessageReceived dep).
  *
  * @param port - Port number to listen on (0 for random)
  * @param deps - Optional dependencies (processManager, scanSessions, etc.)

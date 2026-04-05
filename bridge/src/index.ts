@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 /**
- * remote-cc bridge — HTTP server + WebSocket server + session lifecycle
+ * remote-cc bridge — HTTP server + SSE transport + session lifecycle
  *
  * Wires together all modules:
- *   HTTP server  →  serves web UI static files + session API
- *   WS server    →  attaches to HTTP server for WebSocket upgrade
- *   processManager → manages claude process lifecycle (start/stop/status)
- *   sessionScanner → scans ~/.claude/projects/ for existing sessions
- *   lineReader   →  buffered line reader for claude stdout
- *   initializer  →  handles the initialize handshake
- *   terminalUI   →  prints startup banner and connection status
+ *   HTTP server    →  serves web UI static files + session API + SSE stream
+ *   sseWriter      →  manages SSE connections for server-to-client broadcast
+ *   processManager →  manages claude process lifecycle (start/stop/status)
+ *   sessionScanner →  scans ~/.claude/projects/ for existing sessions
+ *   lineReader     →  buffered line reader for claude stdout
+ *   initializer    →  handles the initialize handshake
+ *   terminalUI     →  prints startup banner and connection status
  *
  * Startup flow:
- *   1. Start HTTP + WS servers
- *   2. Broadcast "waiting_for_session" to connected clients
+ *   1. Start HTTP server (serves SSE stream at GET /events/stream,
+ *      accepts client messages at POST /messages)
+ *   2. Broadcast "waiting_for_session" to connected SSE clients
  *   3. Wait for POST /sessions/start from web UI
  *   4. wireSession(): lineReader → initializer → bidirectional bridge
  *   5. On process exit: broadcast session_ended, reset, wait for next session
@@ -21,11 +22,11 @@
 
 import { parseArgs } from 'node:util'
 import { startHttpServer } from './httpServer.js'
-import { createWsServer } from './wsServer.js'
+import { createSseWriter } from './sseWriter.js'
 import { createLineReader, writeLine } from './lineReader.js'
 import { waitForInitialize, InitializeTimeoutError } from './initializer.js'
 import { printStartupBanner } from './terminalUI.js'
-import { generateToken, createVerifyClient } from './auth.js'
+import { generateToken } from './auth.js'
 import { createMessageCache } from './messageCache.js'
 import { detectTailscale } from './tailscale.js'
 import { checkClaudeVersion } from './versionCheck.js'
@@ -93,82 +94,56 @@ async function main() {
   const pm = createProcessManager()
 
   // -----------------------------------------------------------------------
-  // 3. Start HTTP server with deps (processManager, sessionScanner, callback)
+  // 3. Create message cache + SSE writer (before HTTP server so we can
+  //    pass sseHandler and onMessageReceived as deps)
+  // -----------------------------------------------------------------------
+  const cache = createMessageCache(200)
+  let seq = 0
+  let sessionState: 'waiting_for_session' | 'running' = 'waiting_for_session'
+
+  // Message dedup set for POST /messages idempotency
+  const recentMessageIds = new Set<string>()
+
+  const { writer: sse, handleSseRequest } = createSseWriter({
+    authToken: token,
+    messageCache: cache,
+    getSessionState: () => ({ state: sessionState }),
+  })
+
+  // Track current message handler for cleanup between sessions
+  let currentMessageHandler: ((msg: Record<string, unknown>) => boolean) | null = null
+
+  // -----------------------------------------------------------------------
+  // 4. Start HTTP server with SSE + message deps
   // -----------------------------------------------------------------------
   const { server, url } = await startHttpServer(port, {
     processManager: pm,
     scanSessions: () => scanSessions(),
     onSessionStarted: (proc) => wireSession(proc),
     authToken: token,
+    sseHandler: handleSseRequest,
+    onMessageReceived: (msg) => {
+      if (!currentMessageHandler) return false
+      return currentMessageHandler(msg)
+    },
+    recentMessageIds,
   })
 
   // -----------------------------------------------------------------------
-  // 4. Create WebSocket server with token auth
-  // -----------------------------------------------------------------------
-  const ws = createWsServer(server, {
-    verifyClient: createVerifyClient(token),
-  })
-
-  // -----------------------------------------------------------------------
-  // 5. Create message cache for reconnect replay
-  // -----------------------------------------------------------------------
-  const cache = createMessageCache(200)
-  let seq = 0
-
-  // Track current session state for new WS connections
-  let sessionState: 'waiting_for_session' | 'running' = 'waiting_for_session'
-
-  // -----------------------------------------------------------------------
-  // 6. On new WS connection: send current session state + replay cache
-  // -----------------------------------------------------------------------
-  ws.onConnection((socket, req) => {
-    // Always send current session status to newly connected clients
-    const statusMsg = JSON.stringify({
-      type: 'system',
-      subtype: 'session_status',
-      state: sessionState,
-    })
-    socket.send(statusMsg)
-
-    // Replay cached messages if client provides ?last_seq
-    const urlObj = new URL(req.url ?? '/', 'http://localhost')
-    const lastSeqParam = urlObj.searchParams.get('last_seq')
-    if (lastSeqParam !== null) {
-      const lastSeq = parseInt(lastSeqParam, 10)
-      if (!Number.isNaN(lastSeq)) {
-        const missed = cache.replayWithSeq(lastSeq)
-        for (const entry of missed) {
-          const envelope = JSON.stringify({ seq: entry.seq, data: entry.message })
-          socket.send(envelope)
-        }
-        if (missed.length > 0) {
-          console.log(`   Replay: ${missed.length} cached messages from seq ${lastSeq + 1}`)
-        }
-      }
-    }
-  })
-
-  // -----------------------------------------------------------------------
-  // 7. Detect Tailscale + print terminal UI banner (with token in URLs)
+  // 5. Detect Tailscale + print terminal UI banner (with token in URLs)
   // -----------------------------------------------------------------------
   const tailscale = await detectTailscale()
   await printStartupBanner(url, port, token, tailscale)
 
   // -----------------------------------------------------------------------
-  // 8. wireSession() — called when POST /sessions/start spawns a process
+  // 6. wireSession() — called when POST /sessions/start spawns a process
   // -----------------------------------------------------------------------
-  // Track the current onMessage unsubscribe handle so we can clean up
-  // between sessions (onMessage callbacks accumulate otherwise).
-  let currentMessageHandler: ((data: string) => void) | null = null
 
   function wireSession(proc: ClaudeProcess): void {
     console.log('   Wiring new session...')
 
-    // Unregister previous session's message handler to prevent leaks
-    if (currentMessageHandler) {
-      ws.offMessage(currentMessageHandler)
-      currentMessageHandler = null
-    }
+    // Clear previous message handler
+    currentMessageHandler = null
 
     // Create line reader for claude stdout
     const reader = createLineReader(proc.stdout)
@@ -206,38 +181,33 @@ async function main() {
 
       // Broadcast session_status = running AFTER init completes
       sessionState = 'running'
-      ws.broadcast(JSON.stringify({
-        type: 'system',
-        subtype: 'session_status',
-        state: 'running',
-      }))
+      sse.broadcastStatus('running')
 
       // -------------------------------------------------------------------
       // Bidirectional bridge
-      //   WS client message → write to claude stdin
-      //   claude stdout line → cache + broadcast to all WS clients
+      //   POST /messages → write to claude stdin (via currentMessageHandler)
+      //   claude stdout line → cache + SSE broadcast to all clients
       // -------------------------------------------------------------------
 
-      // Client → claude (register a new message handler)
-      currentMessageHandler = (data: string) => {
+      // Client → claude: register message handler for POST /messages
+      currentMessageHandler = (msg: Record<string, unknown>) => {
         try {
-          const parsed = JSON.parse(data)
-          writeLine(proc.stdin, parsed)
+          writeLine(proc.stdin, msg)
+          return true
         } catch {
-          // Malformed JSON from client — silently ignore
+          return false
         }
       }
-      ws.onMessage(currentMessageHandler)
 
-      // claude → cache + broadcast (continuous read loop)
+      // claude → cache + SSE broadcast (continuous read loop)
+      // sseWriter formats as SSE frame (id/event/data) — no envelope needed here
       try {
         for (;;) {
           const { value, done } = await iterator.next()
           if (done) break
           seq++
           cache.push(value, seq)
-          const envelope = JSON.stringify({ seq, data: value })
-          ws.broadcast(envelope)
+          sse.broadcast(seq, value)
         }
       } catch (err) {
         console.error('Error reading claude stdout:', err)
@@ -250,11 +220,8 @@ async function main() {
     proc.once('exit', (code) => {
       console.log(`\n   Claude process exited with code ${code ?? 0}`)
 
-      // Unregister the message handler to prevent stale writes
-      if (currentMessageHandler) {
-        ws.offMessage(currentMessageHandler)
-        currentMessageHandler = null
-      }
+      // Clear the message handler to prevent stale writes
+      currentMessageHandler = null
 
       // Reset seq counter and message cache for the next session
       seq = 0
@@ -263,25 +230,16 @@ async function main() {
       // Update session state
       sessionState = 'waiting_for_session'
 
-      // Broadcast session_ended + new waiting status to all clients
-      ws.broadcast(JSON.stringify({
-        type: 'system',
-        subtype: 'session_status',
-        state: 'session_ended',
-        exitCode: code ?? 0,
-      }))
-      ws.broadcast(JSON.stringify({
-        type: 'system',
-        subtype: 'session_status',
-        state: 'waiting_for_session',
-      }))
+      // Broadcast session_ended + new waiting status to all SSE clients
+      sse.broadcastStatus('session_ended', { exitCode: code ?? 0 })
+      sse.broadcastStatus('waiting_for_session')
 
       console.log('   Bridge waiting for next session...')
     })
   }
 
   // -----------------------------------------------------------------------
-  // 9. Handle --continue / --resume auto-start, or broadcast waiting status
+  // 7. Handle --continue / --resume auto-start, or broadcast waiting status
   // -----------------------------------------------------------------------
   if (args.continue) {
     // Auto-start: find most recent session and spawn with --continue
@@ -313,11 +271,7 @@ async function main() {
   } else {
     // Default: wait for web UI POST /sessions/start
     console.log('   Bridge started — waiting for session start via web UI')
-    ws.broadcast(JSON.stringify({
-      type: 'system',
-      subtype: 'session_status',
-      state: 'waiting_for_session',
-    }))
+    sse.broadcastStatus('waiting_for_session')
   }
 }
 
