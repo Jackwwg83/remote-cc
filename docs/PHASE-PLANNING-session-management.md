@@ -199,7 +199,7 @@ async function scanSessions(projectDir?: string): Promise<SessionInfo[]>
 
 ### `claude --print --continue` 在 stream-json 模式下可用 ✅
 ```bash
-cd /Users/jackwu/ruidongcc  # 必须从正确的 cwd 启动
+cd /path/to/your/project  # 必须从正确的 cwd 启动
 claude --print --continue \
   --input-format stream-json --output-format stream-json \
   --verbose --max-turns 1

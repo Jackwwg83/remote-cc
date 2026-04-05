@@ -2,7 +2,7 @@
 
 > remote-cc 的每个组件应该参考 rdcc 中对应的实现。
 > 除 Anthropic 认证和后端（OAuth、JWT、claude.ai API）外，所有业务逻辑都以 rdcc 原版为准。
-> 源码目录：`/Users/jackwu/ruidongcc/claude-code-source-code-main/src/`
+> 源码目录：参考 Claude Code 反编译源码的 `src/` 目录
 
 ## bridge 组件
 
