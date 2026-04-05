@@ -19,8 +19,9 @@ const SKIP_SUBTYPES = new Set([
   'session_status',
 ])
 
-// Auth utils re-exported for backward compat (SessionPicker imports from here)
-export { getAuthHeaders } from './authUtils'
+// Auth utils — import for internal use + re-export for backward compat
+import { getAuthHeaders } from './authUtils'
+export { getAuthHeaders }
 
 function getTransportUrl(): string {
   // The transport extracts origin + token from the full page URL
