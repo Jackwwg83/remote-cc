@@ -223,9 +223,10 @@ async function main() {
       // Clear the message handler to prevent stale writes
       currentMessageHandler = null
 
-      // Reset seq counter and message cache for the next session
+      // Reset seq counter, message cache, and dedup set for the next session
       seq = 0
       cache.clear()
+      recentMessageIds.clear()
 
       // Update session state
       sessionState = 'waiting_for_session'
@@ -246,13 +247,14 @@ async function main() {
     const sessions = await scanSessions()
     if (sessions.length === 0) {
       console.log('   No existing sessions found. Starting new session...')
-      await pm.start(process.cwd(), { mode: 'new' })
+      const proc = await pm.start(process.cwd(), { mode: 'new' })
+      wireSession(proc)
     } else {
-      const latest = sessions[0] // sorted desc by time
+      const latest = sessions[0]
       console.log(`   Continuing session: ${latest.shortId} (${latest.project})`)
-      await pm.start(latest.cwd, { mode: 'continue' })
+      const proc = await pm.start(latest.cwd, { mode: 'continue' })
+      wireSession(proc)
     }
-    // wireSession is called via onSessionStarted callback
   } else if (args.resume) {
     // Auto-start: find session by ID and spawn with --resume
     const sessions = await scanSessions()
@@ -266,8 +268,8 @@ async function main() {
       process.exit(1)
     }
     console.log(`   Resuming session: ${target.shortId} (${target.project})`)
-    await pm.start(target.cwd, { mode: 'resume', sessionId: target.id })
-    // wireSession is called via onSessionStarted callback
+    const proc = await pm.start(target.cwd, { mode: 'resume', sessionId: target.id })
+    wireSession(proc)
   } else {
     // Default: wait for web UI POST /sessions/start
     console.log('   Bridge started — waiting for session start via web UI')

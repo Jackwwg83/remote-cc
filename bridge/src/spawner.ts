@@ -24,6 +24,8 @@ export interface ClaudeProcess {
   readonly stdout: Readable
   /** Send SIGTERM to the child process */
   kill(): void
+  /** Send SIGKILL to force-terminate the child process */
+  forceKill(): void
   /** Listen for exit events */
   on(event: 'exit', listener: (code: number | null, signal: string | null) => void): void
   /** Listen once for exit events */
@@ -108,6 +110,12 @@ class ClaudeProcessImpl extends EventEmitter implements ClaudeProcess {
   kill(): void {
     if (!this.child.killed) {
       this.child.kill('SIGTERM')
+    }
+  }
+
+  forceKill(): void {
+    if (!this.child.killed) {
+      this.child.kill('SIGKILL')
     }
   }
 }

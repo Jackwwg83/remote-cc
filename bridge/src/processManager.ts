@@ -164,16 +164,9 @@ export function createProcessManager(): ProcessManager {
 
     proc.kill() // SIGTERM
 
-    // 5-second escalation to SIGKILL.
+    // 5-second escalation: SIGTERM didn't work → SIGKILL
     const killTimer = setTimeout(() => {
-      // The ClaudeProcess interface only exposes kill() which sends SIGTERM,
-      // but the underlying ChildProcess is accessible via the concrete class.
-      // We can't call SIGKILL through the public interface, so we rely on
-      // spawner.ts signal-forwarding for the SIGKILL escalation.
-      // To implement it here we accept the kill() is SIGTERM-only and if
-      // the process does not respond we emit an emergency kill via the
-      // public kill() — which is idempotent and won't throw even if dead.
-      proc.kill()
+      proc.forceKill()
     }, 5000)
     // Unref so this timer doesn't keep the Node event loop alive.
     ;(killTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.()

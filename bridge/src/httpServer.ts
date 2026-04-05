@@ -15,7 +15,7 @@
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { join, extname } from 'node:path'
+import { join, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ProcessManager, ProcessState } from './processManager.js'
 import type { SessionInfo } from './sessionScanner.js'
@@ -128,9 +128,10 @@ async function tryServeStatic(urlPath: string, res: ServerResponse): Promise<boo
   if (!WEB_DIST_EXISTS) return false
 
   const filePath = urlPath === '/' ? '/index.html' : urlPath
-  if (filePath.includes('..')) return false
+  const fullPath = resolve(WEB_DIST_DIR, '.' + filePath)
 
-  const fullPath = join(WEB_DIST_DIR, filePath)
+  // Security: ensure resolved path is within the dist directory
+  if (!fullPath.startsWith(WEB_DIST_DIR)) return false
   const ext = extname(fullPath)
   const contentType = MIME_TYPES[ext] ?? 'application/octet-stream'
 

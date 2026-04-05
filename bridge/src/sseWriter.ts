@@ -98,9 +98,9 @@ export function createSseWriter(deps: SseWriterDeps): {
     for (const res of clients) {
       if (res.destroyed) { clients.delete(res); continue }
       if (res.writableLength >= BACKPRESSURE_THRESHOLD) {
-        console.warn(
-          `[sseWriter] skipping client (writableLength ${res.writableLength} > ${BACKPRESSURE_THRESHOLD})`,
-        )
+        console.warn(`[sseWriter] closing slow client (writableLength ${res.writableLength})`)
+        clients.delete(res)
+        res.end()
         continue
       }
       res.write(frame)
@@ -129,18 +129,24 @@ export function createSseWriter(deps: SseWriterDeps): {
 
   function handleSseRequest(req: IncomingMessage, res: ServerResponse): void {
     // Auth check — uses shared verifyToken (header + query param)
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    }
+
     if (!verifyToken(req, authToken)) {
-      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.writeHead(401, { 'Content-Type': 'application/json', ...corsHeaders })
       res.end(JSON.stringify({ error: 'Unauthorized' }))
       return
     }
 
-    // --- SSE response headers ---
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
+      ...corsHeaders,
     })
 
     clients.add(res)

@@ -274,8 +274,9 @@ export default function App() {
   const handlePermission = useCallback(async (action: PermissionAction) => {
     if (!wsRef.current) return
 
+    let ok = false
     if (action.behavior === 'allow') {
-      await wsRef.current.send({
+      ok = await wsRef.current.send({
         type: 'control_response',
         response: {
           subtype: 'success',
@@ -284,8 +285,7 @@ export default function App() {
         },
       })
     } else if (action.behavior === 'always_allow') {
-      // B-07: Always Allow — send allow + permission rule for this tool
-      await wsRef.current.send({
+      ok = await wsRef.current.send({
         type: 'control_response',
         response: {
           subtype: 'success',
@@ -303,7 +303,7 @@ export default function App() {
         },
       })
     } else {
-      await wsRef.current.send({
+      ok = await wsRef.current.send({
         type: 'control_response',
         response: {
           subtype: 'success',
@@ -313,11 +313,17 @@ export default function App() {
       })
     }
 
-    setPendingPerms((prev) => {
-      const next = new Map(prev)
-      next.delete(action.requestId)
-      return next
-    })
+    // Only dismiss the dialog if the response was delivered.
+    // If send failed, keep the dialog so the user can retry.
+    if (ok) {
+      setPendingPerms((prev) => {
+        const next = new Map(prev)
+        next.delete(action.requestId)
+        return next
+      })
+    } else {
+      console.error('Failed to send permission response — dialog kept for retry')
+    }
   }, [])
 
   // T-F10: Start a new or existing session via REST API

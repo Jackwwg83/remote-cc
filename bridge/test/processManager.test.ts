@@ -47,6 +47,9 @@ function makeFakeProcess(): FakeProcess {
     kill(): void {
       killed = true
     },
+    forceKill(): void {
+      killed = true
+    },
     get killCalled(): boolean {
       return killed
     },

@@ -299,11 +299,13 @@ export function connectTransport(baseHttpUrl: string) {
             body: JSON.stringify(body),
           })
           if (res.ok) return true
-          // Permanent errors — don't retry
           if (res.status === 401 || res.status === 400) return false
-          // 5xx / 503 — retry
         } catch {
-          // Network error — retry
+          // Network error — retry after delay
+        }
+        // Wait 500ms before retry (gives transient failures time to resolve)
+        if (attempt < SEND_RETRIES - 1) {
+          await new Promise(r => setTimeout(r, 500))
         }
       }
       return false
