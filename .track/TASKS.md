@@ -112,9 +112,13 @@
 ## 功能缺口（手机联合测试发现，走新增功能流程）
 
 ### 必做（不做基本不可用）
-- [ ] F-01: Session 管理 — 支持 --continue（恢复最近会话）和 --resume <session_id>（指定会话），通过 bridge CLI 参数或 web UI 选择
+- [x] F-01: Session 管理 — ✅ v0.2.0 (sessionScanner + processManager + SessionPicker + --continue/--resume)
 - [ ] F-02: Slash commands — /model /compact /clear /cost 等需要通过 control_request 协议发送，不是 user message。Quick Commands 面板需要重做
 
 ### 应做（提升体验）
-- [ ] F-03: 会话列表 — web UI 显示可用 sessions，点击切换
+- [x] F-03: 会话列表 — ✅ v0.2.0 (SessionPicker with GET /sessions/history)
 - [ ] F-04: 模型切换 — web UI 的模型选择器，通过 set_model control_request 切换
+
+### 已完成（v0.2.0）
+- [x] SSE + POST 传输层 — 替代 WebSocket，EventSource 原生重连，45s liveness timeout，15s keepalive
+- [x] Phase 7 质量关 — /simplify + /review(Codex+CC) + /qa + /verification，20 issues fixed
