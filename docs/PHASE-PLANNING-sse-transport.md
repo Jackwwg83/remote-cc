@@ -373,12 +373,13 @@ sseWriter.broadcast(seq, rawJson)
        // ... 现有字段 ...
        /** SSE writer 的请求处理器 */
        sseHandler?: (req: IncomingMessage, res: ServerResponse) => void
-       /** POST /messages 的消息回调 */
-       onMessageReceived?: (msg: Record<string, unknown>) => void
+       /** POST /messages 的消息回调，返回 false 表示无活跃 session（→ 503） */
+       onMessageReceived?: (msg: Record<string, unknown>) => boolean
      }
      ```
-   - httpServer.ts 路由匹配到 `GET /events/stream` 时调用 `deps.sseHandler(req, res)`
-   - 路由匹配到 `POST /messages` 时：auth check → JSON parse → `deps.onMessageReceived(parsed)`
+   - httpServer.ts 路由使用 `new URL(req.url, base).pathname` 匹配（不是 raw `req.url` 字符串比较，因为带 query params）
+   - `pathname === '/events/stream'` 时调用 `deps.sseHandler(req, res)`
+   - `pathname === '/messages'` 时：auth check → JSON parse → `const ok = deps.onMessageReceived(parsed)` → ok ? 200 : 503
    - index.ts 在创建 sseWriter 后，将 handler 传入 httpServer deps
 
 7. **token 传递和初始状态 emit**
