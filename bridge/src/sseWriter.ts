@@ -12,6 +12,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { MessageCache } from './messageCache.js'
+import { verifyToken } from './auth.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -95,7 +96,7 @@ export function createSseWriter(deps: SseWriterDeps): {
    */
   function writeToAll(frame: string): void {
     for (const res of clients) {
-      if (res.destroyed) continue
+      if (res.destroyed) { clients.delete(res); continue }
       if (res.writableLength >= BACKPRESSURE_THRESHOLD) {
         console.warn(
           `[sseWriter] skipping client (writableLength ${res.writableLength} > ${BACKPRESSURE_THRESHOLD})`,
@@ -127,15 +128,11 @@ export function createSseWriter(deps: SseWriterDeps): {
   // -------------------------------------------------------------------------
 
   function handleSseRequest(req: IncomingMessage, res: ServerResponse): void {
-    // --- Auth check ---
-    if (authToken) {
-      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
-      const token = url.searchParams.get('token')
-      if (token !== authToken) {
-        res.writeHead(401, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ error: 'Unauthorized' }))
-        return
-      }
+    // Auth check — uses shared verifyToken (header + query param)
+    if (!verifyToken(req, authToken)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Unauthorized' }))
+      return
     }
 
     // --- SSE response headers ---
@@ -146,7 +143,6 @@ export function createSseWriter(deps: SseWriterDeps): {
       'X-Accel-Buffering': 'no',
     })
 
-    // Register client before sending so it is included in future broadcasts
     clients.add(res)
 
     // --- Send initial session state ---
@@ -154,8 +150,7 @@ export function createSseWriter(deps: SseWriterDeps): {
     writeToOne(res, `event:session_status\ndata:${JSON.stringify(sessionState)}\n\n`)
 
     // --- Replay missed messages ---
-    // Browser auto-sends Last-Event-ID header on EventSource reconnect.
-    // Callers may also supply ?from_seq=N explicitly. Use the maximum of both.
+    // Parse URL once for from_seq and last-event-id
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
 
     const lastEventIdHeader = req.headers['last-event-id']

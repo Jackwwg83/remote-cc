@@ -27,7 +27,28 @@ export function generateToken(): string {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket verifyClient
+// Shared token verification (used by HTTP routes + SSE endpoint)
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if the request carries a valid auth token.
+ * Checks Authorization header first, falls back to ?token= query param.
+ * Returns true if token matches or no token is required.
+ */
+export function verifyToken(req: IncomingMessage, token: string | undefined): boolean {
+  if (!token) return true
+  const authHeader = req.headers['authorization']
+  if (authHeader === `Bearer ${token}`) return true
+  try {
+    const url = new URL(req.url ?? '', `http://${req.headers.host}`)
+    const queryToken = url.searchParams.get('token')
+    if (queryToken === token) return true
+  } catch { /* malformed URL */ }
+  return false
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket verifyClient (legacy — kept for reference, unused after SSE migration)
 // ---------------------------------------------------------------------------
 
 /**

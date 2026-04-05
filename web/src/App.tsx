@@ -9,18 +9,18 @@ import InstallPrompt from './InstallPrompt'
 import QuickCommands from './QuickCommands'
 import SessionPicker from './SessionPicker'
 
-/** Extract the auth token from the page URL (?token=xxx) */
-function getAuthToken(): string | null {
-  return new URLSearchParams(window.location.search).get('token')
-}
+/** System subtypes that are internal/technical — never shown in chat */
+const SKIP_SUBTYPES = new Set([
+  'init', 'hook_started', 'hook_response', 'hook_progress',
+  'compact_boundary', 'microcompact_boundary',
+  'task_started', 'task_progress', 'task_notification',
+  'session_state_changed', 'files_persisted',
+  'status', 'api_retry', 'rate_limit', 'rate_limit_event',
+  'session_status',
+])
 
-/** Build headers with auth token for HTTP API requests */
-export function getAuthHeaders(): Record<string, string> {
-  const token = getAuthToken()
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (token) headers['Authorization'] = `Bearer ${token}`
-  return headers
-}
+// Auth utils re-exported for backward compat (SessionPicker imports from here)
+export { getAuthHeaders } from './authUtils'
 
 function getTransportUrl(): string {
   // The transport extracts origin + token from the full page URL
@@ -203,15 +203,7 @@ export default function App() {
         const sub = (d as Record<string, unknown>).subtype as string
         // Skip technical messages (init, hooks, compact boundaries)
         // B-03: Skip all technical/internal system subtypes
-        const skipSubtypes = new Set([
-          'init', 'hook_started', 'hook_response', 'hook_progress',
-          'compact_boundary', 'microcompact_boundary',
-          'task_started', 'task_progress', 'task_notification',
-          'session_state_changed', 'files_persisted',
-          'status', 'api_retry', 'rate_limit', 'rate_limit_event',
-          'session_status',
-        ])
-        if (!skipSubtypes.has(sub)) {
+        if (!SKIP_SUBTYPES.has(sub)) {
           setMessages((prev) => [...prev, data as ChatMessage])
         }
         return

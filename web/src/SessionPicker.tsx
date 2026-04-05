@@ -1,6 +1,6 @@
 // T-F09: Session selection UI — list recent sessions or start a new one
 import { useState, useEffect, useCallback } from 'react'
-import { getAuthHeaders } from './App'
+import { getAuthHeaders } from './authUtils'
 
 interface SessionInfo {
   id: string

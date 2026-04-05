@@ -13,12 +13,14 @@
  */
 
 import { createServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { join, extname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ProcessManager, ProcessState } from './processManager.js'
 import type { SessionInfo } from './sessionScanner.js'
 import type { ClaudeProcess, SpawnClaudeOptions } from './spawner.js'
+import { verifyToken } from './auth.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -119,28 +121,21 @@ function sendHtml(res: ServerResponse, statusCode: number, html: string): void {
 }
 
 /**
- * Try to serve a static file from the web dist directory.
+ * Try to serve a static file from the web dist directory (async).
  * Returns true if the file was served, false otherwise.
  */
-function tryServeStatic(urlPath: string, res: ServerResponse): boolean {
+async function tryServeStatic(urlPath: string, res: ServerResponse): Promise<boolean> {
   if (!WEB_DIST_EXISTS) return false
 
-  // Normalize: "/" → "/index.html"
-  let filePath = urlPath === '/' ? '/index.html' : urlPath
-
-  // Security: prevent directory traversal
+  const filePath = urlPath === '/' ? '/index.html' : urlPath
   if (filePath.includes('..')) return false
 
   const fullPath = join(WEB_DIST_DIR, filePath)
-
-  // Check file exists
-  if (!existsSync(fullPath)) return false
-
   const ext = extname(fullPath)
   const contentType = MIME_TYPES[ext] ?? 'application/octet-stream'
 
   try {
-    const content = readFileSync(fullPath)
+    const content = await readFile(fullPath)
     for (const [key, value] of Object.entries(CORS_HEADERS)) {
       res.setHeader(key, value)
     }
@@ -156,23 +151,7 @@ function tryServeStatic(urlPath: string, res: ServerResponse): boolean {
 // Body parsing helper
 // ---------------------------------------------------------------------------
 
-/**
- * Check if the request carries a valid auth token (header or query param).
- * Returns true if auth passes or no token is required.
- */
-function checkAuth(req: IncomingMessage, token: string | undefined): boolean {
-  if (!token) return true // no auth required
-  // Check Authorization header
-  const authHeader = req.headers['authorization']
-  if (authHeader === `Bearer ${token}`) return true
-  // Fallback: check ?token= query parameter
-  try {
-    const url = new URL(req.url ?? '', `http://${req.headers.host}`)
-    const queryToken = url.searchParams.get('token')
-    if (queryToken === token) return true
-  } catch { /* malformed URL */ }
-  return false
-}
+// Auth check delegates to shared verifyToken from auth.ts
 
 /** Max body size for POST requests (64 KiB — more than enough for JSON control messages). */
 const MAX_BODY_BYTES = 64 * 1024
@@ -278,24 +257,9 @@ async function handleRequestAsync(
     return
   }
 
-  // Route: GET /sessions/history — list all scannable sessions
-  if (method === 'GET' && pathname === '/sessions/history') {
-    if (!checkAuth(req, deps.authToken)) {
-      sendJson(res, 401, { error: 'Unauthorized' })
-      return
-    }
-    if (!deps.scanSessions) {
-      sendJson(res, 200, { sessions: [] })
-      return
-    }
-    const sessions = await deps.scanSessions()
-    sendJson(res, 200, { sessions })
-    return
-  }
-
-  // Route: GET /sessions — alias for /sessions/history (backward compat)
-  if (method === 'GET' && pathname === '/sessions') {
-    if (!checkAuth(req, deps.authToken)) {
+  // Route: GET /sessions/history (or /sessions alias) — list all scannable sessions
+  if (method === 'GET' && (pathname === '/sessions/history' || pathname === '/sessions')) {
+    if (!verifyToken(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
     }
@@ -310,7 +274,7 @@ async function handleRequestAsync(
 
   // Route: GET /sessions/status — current process state
   if (method === 'GET' && pathname === '/sessions/status') {
-    if (!checkAuth(req, deps.authToken)) {
+    if (!verifyToken(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
     }
@@ -328,7 +292,7 @@ async function handleRequestAsync(
 
   // Route: POST /messages — receive client messages for SSE transport
   if (method === 'POST' && pathname === '/messages') {
-    if (!checkAuth(req, deps.authToken)) {
+    if (!verifyToken(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
     }
@@ -377,7 +341,7 @@ async function handleRequestAsync(
 
   // Route: POST /sessions/start — start a new or resumed session
   if (method === 'POST' && pathname === '/sessions/start') {
-    if (!checkAuth(req, deps.authToken)) {
+    if (!verifyToken(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
     }
@@ -447,7 +411,7 @@ async function handleRequestAsync(
 
   // Route: POST /sessions/stop — stop the current process
   if (method === 'POST' && pathname === '/sessions/stop') {
-    if (!checkAuth(req, deps.authToken)) {
+    if (!verifyToken(req, deps.authToken)) {
       sendJson(res, 401, { error: 'Unauthorized' })
       return
     }
@@ -463,13 +427,10 @@ async function handleRequestAsync(
 
   // Static file serving for GET requests
   if (method === 'GET') {
-    // Try to serve from web/dist/
-    if (tryServeStatic(pathname, res)) return
+    if (await tryServeStatic(pathname, res)) return
 
-    // SPA fallback: for paths that don't match a file, serve index.html
-    // (lets client-side routing work if we add it later)
     if (pathname !== '/' && !extname(pathname) && WEB_DIST_EXISTS) {
-      if (tryServeStatic('/', res)) return
+      if (await tryServeStatic('/', res)) return
     }
 
     // No dist dir — show placeholder
