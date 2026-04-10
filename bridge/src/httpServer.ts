@@ -49,8 +49,9 @@ export interface HttpServerDeps {
   /** Process lifecycle manager — start/stop/status */
   processManager?: ProcessManager
   /** Called after a process is started via POST /sessions/start.
-   *  index.ts hooks this to wire up lineReader, WS bridge, etc. */
-  onSessionStarted?: (proc: ClaudeProcess) => void
+   *  index.ts hooks this to wire up lineReader, SSE bridge, etc.
+   *  sessionId is provided when resuming an existing session. */
+  onSessionStarted?: (proc: ClaudeProcess, sessionId?: string) => void
   /** Auth token for session control endpoints. If set, these endpoints require
    *  `Authorization: Bearer <token>` header or `?token=` query parameter. */
   authToken?: string
@@ -397,7 +398,7 @@ async function handleRequestAsync(
       const proc = await pm.start(targetCwd, spawnOpts)
       // Notify index.ts (or whoever registered the callback) so it can
       // wire up lineReader, WS bridge, etc.
-      deps.onSessionStarted?.(proc)
+      deps.onSessionStarted?.(proc, sessionId as string | undefined)
       sendJson(res, 200, {
         ok: true,
         sessionId: pm.sessionId ?? null,

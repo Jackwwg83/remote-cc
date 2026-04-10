@@ -141,20 +141,26 @@ export async function printStartupBanner(
     console.log(`   ${chalk.dim('Token:')}      ${chalk.yellow(token)}`)
   }
 
-  // QR code — use best available URL
-  const bestUrl = tailscaleIp
-    ? `http://${tailscaleIp}:${port}${qs}`
-    : addrs.lan
-      ? `http://${addrs.lan}:${port}${qs}`
-      : `http://localhost:${port}${qs}`
+  // QR codes — show one per available network (LAN + Tailscale)
+  const qrUrls: { label: string; url: string }[] = []
+  if (addrs.lan) {
+    qrUrls.push({ label: 'LAN', url: `http://${addrs.lan}:${port}${qs}` })
+  }
+  if (tailscaleIp) {
+    qrUrls.push({ label: 'Tailscale', url: `http://${tailscaleIp}:${port}${qs}` })
+  }
+  if (qrUrls.length === 0) {
+    qrUrls.push({ label: 'Local', url: `http://localhost:${port}${qs}` })
+  }
 
-  const qr = await generateQR(bestUrl)
-  if (qr) {
-    console.log()
-    console.log(`   ${chalk.dim('Scan to connect:')}`)
-    // Indent each QR line for alignment
-    for (const line of qr.split('\n')) {
-      if (line) console.log(`   ${line}`)
+  for (const { label, url } of qrUrls) {
+    const qr = await generateQR(url)
+    if (qr) {
+      console.log()
+      console.log(`   ${chalk.dim(`Scan to connect (${label}):`)}`)
+      for (const line of qr.split('\n')) {
+        if (line) console.log(`   ${line}`)
+      }
     }
   }
 

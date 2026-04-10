@@ -33,6 +33,7 @@ import { checkClaudeVersion } from './versionCheck.js'
 import { createProcessManager } from './processManager.js'
 import { scanSessions } from './sessionScanner.js'
 import type { ClaudeProcess } from './spawner.js'
+import { readSessionHistory } from './sessionHistory.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -119,7 +120,7 @@ async function main() {
   const { server, url } = await startHttpServer(port, {
     processManager: pm,
     scanSessions: () => scanSessions(),
-    onSessionStarted: (proc) => wireSession(proc),
+    onSessionStarted: (proc, sessionId) => wireSession(proc, sessionId),
     authToken: token,
     sseHandler: handleSseRequest,
     onMessageReceived: (msg) => {
@@ -139,7 +140,7 @@ async function main() {
   // 6. wireSession() — called when POST /sessions/start spawns a process
   // -----------------------------------------------------------------------
 
-  function wireSession(proc: ClaudeProcess): void {
+  function wireSession(proc: ClaudeProcess, sessionId?: string): void {
     console.log('   Wiring new session...')
 
     // Clear previous message handler
@@ -179,7 +180,24 @@ async function main() {
 
       console.log('   Claude process ready (initialize handshake complete)')
 
-      // Broadcast session_status = running AFTER init completes
+      // Replay conversation history for resumed sessions
+      if (sessionId) {
+        try {
+          const history = await readSessionHistory(sessionId)
+          if (history.length > 0) {
+            console.log(`   Replaying ${history.length} historical messages`)
+            for (const msg of history) {
+              seq++
+              cache.push(msg.raw, seq)
+              sse.broadcast(seq, msg.raw)
+            }
+          }
+        } catch (err) {
+          console.error('   Warning: failed to read session history:', err)
+        }
+      }
+
+      // Broadcast session_status = running AFTER history replay
       sessionState = 'running'
       sse.broadcastStatus('running')
 
@@ -253,7 +271,7 @@ async function main() {
       const latest = sessions[0]
       console.log(`   Continuing session: ${latest.shortId} (${latest.project})`)
       const proc = await pm.start(latest.cwd, { mode: 'continue' })
-      wireSession(proc)
+      wireSession(proc, latest.id)
     }
   } else if (args.resume) {
     // Auto-start: find session by ID and spawn with --resume
@@ -269,7 +287,7 @@ async function main() {
     }
     console.log(`   Resuming session: ${target.shortId} (${target.project})`)
     const proc = await pm.start(target.cwd, { mode: 'resume', sessionId: target.id })
-    wireSession(proc)
+    wireSession(proc, target.id)
   } else {
     // Default: wait for web UI POST /sessions/start
     console.log('   Bridge started — waiting for session start via web UI')
