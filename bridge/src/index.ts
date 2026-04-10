@@ -180,7 +180,21 @@ async function main() {
 
       console.log('   Claude process ready (initialize handshake complete)')
 
-      // Replay conversation history for resumed sessions
+      // Register message handler FIRST so user input works immediately
+      currentMessageHandler = (msg: Record<string, unknown>) => {
+        try {
+          writeLine(proc.stdin, msg)
+          return true
+        } catch {
+          return false
+        }
+      }
+
+      // Switch to running state FIRST so UI shows chat view
+      sessionState = 'running'
+      sse.broadcastStatus('running')
+
+      // THEN replay conversation history (arrives after UI is in chat view)
       if (sessionId) {
         try {
           const history = await readSessionHistory(sessionId)
@@ -194,26 +208,6 @@ async function main() {
           }
         } catch (err) {
           console.error('   Warning: failed to read session history:', err)
-        }
-      }
-
-      // Broadcast session_status = running AFTER history replay
-      sessionState = 'running'
-      sse.broadcastStatus('running')
-
-      // -------------------------------------------------------------------
-      // Bidirectional bridge
-      //   POST /messages → write to claude stdin (via currentMessageHandler)
-      //   claude stdout line → cache + SSE broadcast to all clients
-      // -------------------------------------------------------------------
-
-      // Client → claude: register message handler for POST /messages
-      currentMessageHandler = (msg: Record<string, unknown>) => {
-        try {
-          writeLine(proc.stdin, msg)
-          return true
-        } catch {
-          return false
         }
       }
 
