@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, act } from '@testing-library/react'
 
 // ---------------------------------------------------------------------------
 // Mock transport BEFORE importing App
@@ -124,19 +124,22 @@ describe('App cluster mode view routing', () => {
     const App = AppMod.default
     render(<App />)
 
-    // Wait for dashboard to render
     await screen.findByText('Machines')
-    // Wait for transport to be created
     await waitFor(() => expect(transportInstance).not.toBeNull())
 
-    // Simulate server emitting its own waiting_for_session event
-    transportInstance!.fireMessage({
-      type: 'system',
-      subtype: 'session_status',
-      state: 'waiting_for_session',
+    // Fire the event inside act() so React state updates flush, and
+    // wait for microtasks before asserting. If the isClusterMode guard
+    // were missing, setView('picker') would swap the tree here.
+    await act(async () => {
+      transportInstance!.fireMessage({
+        type: 'system',
+        subtype: 'session_status',
+        state: 'waiting_for_session',
+      })
+      await Promise.resolve()
     })
 
-    // Should STILL be on dashboard (not bounced to picker)
+    // After the re-render, dashboard is still showing and picker is NOT
     expect(screen.getByText('Machines')).toBeTruthy()
     expect(screen.queryByText('Select a session')).toBeNull()
   })
@@ -148,14 +151,53 @@ describe('App cluster mode view routing', () => {
     await screen.findByText('Machines')
     await waitFor(() => expect(transportInstance).not.toBeNull())
 
-    transportInstance!.fireMessage({
-      type: 'system',
-      subtype: 'session_status',
-      state: 'session_ended',
-      exitCode: 0,
+    await act(async () => {
+      transportInstance!.fireMessage({
+        type: 'system',
+        subtype: 'session_status',
+        state: 'session_ended',
+        exitCode: 0,
+      })
+      await Promise.resolve()
     })
 
     expect(screen.getByText('Machines')).toBeTruthy()
     expect(screen.queryByText('Select a session')).toBeNull()
+  })
+
+  it('negative control: in standalone mode (no cluster_token), waiting_for_session DOES route to picker', async () => {
+    // Reset URL to standalone mode
+    Object.defineProperty(window, 'location', {
+      value: { ...window.location, search: '?token=sess-tok', href: 'http://localhost/?token=sess-tok' },
+      writable: true,
+    })
+    vi.resetModules()
+
+    const AppMod = await import('../App')
+    const App = AppMod.default
+    render(<App />)
+
+    // Standalone mode starts on picker, so it's already there. Transition to chat first.
+    await waitFor(() => expect(transportInstance).not.toBeNull())
+    await act(async () => {
+      transportInstance!.fireMessage({
+        type: 'system',
+        subtype: 'session_status',
+        state: 'running',
+      })
+      await Promise.resolve()
+    })
+    // Now in chat; firing waiting_for_session should bounce back to picker
+    await act(async () => {
+      transportInstance!.fireMessage({
+        type: 'system',
+        subtype: 'session_status',
+        state: 'waiting_for_session',
+      })
+      await Promise.resolve()
+    })
+    // Picker heading appears
+    await waitFor(() => expect(screen.getByText('Select a session')).toBeTruthy())
+    expect(screen.queryByText('Machines')).toBeNull()
   })
 })
