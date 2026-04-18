@@ -181,7 +181,15 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
         try { controller.abort() } catch { /* already aborted */ }
       }
       if (upstreamReader) {
-        try { void upstreamReader.cancel() } catch { /* already cancelled */ }
+        try {
+          // .cancel() returns a Promise that may reject with ABORT_ERR when
+          // the fetch is being aborted — catch both sync throws and async
+          // rejections to avoid unhandled promise rejections.
+          const p = upstreamReader.cancel()
+          if (p && typeof (p as Promise<unknown>).catch === 'function') {
+            ;(p as Promise<unknown>).catch(() => {})
+          }
+        } catch { /* already cancelled */ }
       }
     }
 

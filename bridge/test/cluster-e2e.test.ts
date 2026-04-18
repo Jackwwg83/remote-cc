@@ -45,28 +45,38 @@ function makeFakeProc(): ClaudeProcess {
   return ee
 }
 
-function makeFakePM(): ProcessManager & { _fakeStart: ReturnType<typeof makeFakeProc> | null } {
+interface FakePM extends ProcessManager {
+  startCalls: Array<{ cwd: string; sessionId?: string }>
+  stopCalls: number
+}
+
+function makeFakePM(): FakePM {
   let state: ProcessState = 'idle'
   let currentSession: string | undefined
   let currentProc: ClaudeProcess | null = null
+  const startCalls: Array<{ cwd: string; sessionId?: string }> = []
+  let stopCalls = 0
   return {
     get state() { return state },
     get sessionId() { return currentSession },
     get process() { return currentProc },
-    async start(_cwd, opts) {
+    async start(cwd, opts) {
+      startCalls.push({ cwd, sessionId: opts?.sessionId })
       state = 'running'
       currentSession = opts?.sessionId
       currentProc = makeFakeProc()
       return currentProc
     },
     async stop() {
+      stopCalls++
       state = 'idle'
       if (currentProc) currentProc.kill()
       currentProc = null
       currentSession = undefined
     },
-    _fakeStart: null,
-  } as unknown as ProcessManager & { _fakeStart: ReturnType<typeof makeFakeProc> | null }
+    get startCalls() { return startCalls },
+    get stopCalls() { return stopCalls },
+  } as unknown as FakePM
 }
 
 // ---------------------------------------------------------------------------
@@ -78,10 +88,14 @@ interface Harness {
   serverHttp: HttpServer
   serverUrl: string
   serverSessionToken: string
+  serverScanCalls: { count: number }
   clientHttp: HttpServer
   clientUrl: string
   clientSessionToken: string
   clientId: string
+  clientPM: FakePM
+  clientReceivedMessages: unknown[]
+  clientSseWriter: ReturnType<typeof createSseWriter>['writer']
   clusterClient: ClusterClient | null
 }
 
@@ -116,8 +130,15 @@ async function setup(): Promise<Harness> {
     },
   })
   const serverProxy = createClusterProxy({ cluster: serverManager })
+  const serverScanCalls = { count: 0 }
   const { server: serverHttp } = await startHttpServer(parseInt(serverPort, 10), {
     authToken: serverSessionToken,
+    scanSessions: async () => {
+      serverScanCalls.count++
+      return [
+        { id: 'sess-server-1', shortId: 'sv01', project: 'srv-proj', cwd: '/srv', time: '2026-04-18T09:00:00Z', summary: 'server-local session' },
+      ]
+    },
     clusterManager: serverManager,
     clusterProxy: serverProxy,
     clusterToken: CLUSTER_TOKEN,
@@ -132,6 +153,7 @@ async function setup(): Promise<Harness> {
     getSessionState: () => ({ state: 'waiting_for_session' }),
   })
   const pm = makeFakePM()
+  const clientReceivedMessages: unknown[] = []
   let currentMessageHandler: ((msg: Record<string, unknown>) => boolean) | null = null
   const { server: clientHttp, url: clientUrl } = await startHttpServer(0, {
     authToken: clientSessionToken,
@@ -141,8 +163,8 @@ async function setup(): Promise<Harness> {
     ],
     sseHandler: handleSseRequest,
     onSessionStarted: (proc) => {
-      // Install a simple message echo handler + broadcast a tick
-      currentMessageHandler = (_msg) => true
+      // Install a message-capturing handler
+      currentMessageHandler = (msg) => { clientReceivedMessages.push(msg); return true }
       // Broadcast an "init" event so the proxy has something to pipe back
       setImmediate(() => sse.broadcast(1, JSON.stringify({ type: 'system', subtype: 'init', hello: 'e2e' })))
       proc.once('exit', () => { currentMessageHandler = null })
@@ -164,10 +186,14 @@ async function setup(): Promise<Harness> {
     serverHttp,
     serverUrl: serverLocal,
     serverSessionToken,
+    serverScanCalls,
     clientHttp,
     clientUrl: clientLocal,
     clientSessionToken,
     clientId,
+    clientPM: pm,
+    clientReceivedMessages,
+    clientSseWriter: sse,
     clusterClient: null,
   }
 }
@@ -242,7 +268,7 @@ describe('cluster E2E (2 machines in-process)', () => {
     expect(m?.project).toBe('live-proj')
   })
 
-  it('/cluster/sessions?refresh=true fans out to client /sessions/history', async () => {
+  it('/cluster/sessions?refresh=true fans out to BOTH client and server-self /sessions/history', async () => {
     h.clusterClient = createClusterClient({
       serverUrl: h.serverUrl,
       clusterToken: CLUSTER_TOKEN,
@@ -254,15 +280,21 @@ describe('cluster E2E (2 machines in-process)', () => {
     })
     await h.clusterClient.start()
 
+    const scansBefore = h.serverScanCalls.count
     const res = await fetch(`${h.serverUrl}/cluster/sessions?refresh=true`, {
       headers: { 'Authorization': `Bearer ${CLUSTER_TOKEN}` },
     })
     expect(res.status).toBe(200)
     const json = await res.json() as { sessions: Array<{ id: string; machineId: string }> }
+    // Client's session must be present
     expect(json.sessions.some((s) => s.id === 'sess-e2e-1' && s.machineId === h.clientId)).toBe(true)
+    // Server's OWN session must also be present (fan-out self-call worked)
+    expect(json.sessions.some((s) => s.id === 'sess-server-1' && s.machineId === 'srv-id')).toBe(true)
+    // Server scanSessions endpoint was actually hit by the fan-out
+    expect(h.serverScanCalls.count).toBeGreaterThan(scansBefore)
   })
 
-  it('POST /cluster/action forwards start_session to client', async () => {
+  it('POST /cluster/action forwards start_session → client ProcessManager actually started', async () => {
     h.clusterClient = createClusterClient({
       serverUrl: h.serverUrl,
       clusterToken: CLUSTER_TOKEN,
@@ -274,17 +306,20 @@ describe('cluster E2E (2 machines in-process)', () => {
     })
     await h.clusterClient.start()
 
+    expect(h.clientPM.startCalls).toHaveLength(0)
     const res = await fetch(`${h.serverUrl}/cluster/action`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${CLUSTER_TOKEN}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ machineId: h.clientId, action: 'start_session' }),
+      body: JSON.stringify({ machineId: h.clientId, action: 'start_session', sessionId: 'abc-123' }),
     })
     expect(res.status).toBe(200)
-    const json = await res.json()
-    expect(json.ok).toBe(true)
+    // Downstream side effect: the client's fake PM saw start() called with sessionId
+    expect(h.clientPM.startCalls).toHaveLength(1)
+    expect(h.clientPM.startCalls[0].sessionId).toBe('abc-123')
+    expect(h.clientPM.state).toBe('running')
   })
 
   it('POST /cluster/action for offline machine returns 404', async () => {
@@ -300,7 +335,7 @@ describe('cluster E2E (2 machines in-process)', () => {
     expect(res.status).toBe(404)
   })
 
-  it('POST /cluster/message forwards to client /messages', async () => {
+  it('POST /cluster/message forwards to client /messages → message captured downstream', async () => {
     h.clusterClient = createClusterClient({
       serverUrl: h.serverUrl,
       clusterToken: CLUSTER_TOKEN,
@@ -312,23 +347,26 @@ describe('cluster E2E (2 machines in-process)', () => {
     })
     await h.clusterClient.start()
 
-    // Start a session on the client first (so the message handler is wired)
+    // Start session so the handler is wired
     await fetch(`${h.serverUrl}/cluster/action`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${CLUSTER_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ machineId: h.clientId, action: 'start_session' }),
     })
 
-    // Now proxy a message
+    const beforeCount = h.clientReceivedMessages.length
     const res = await fetch(`${h.serverUrl}/cluster/message?machineId=${h.clientId}`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${CLUSTER_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'user', text: 'hi via proxy' }),
     })
     expect(res.status).toBe(200)
+    // Downstream side effect: client's onMessageReceived handler actually saw the message
+    expect(h.clientReceivedMessages.length).toBe(beforeCount + 1)
+    expect(h.clientReceivedMessages[beforeCount]).toMatchObject({ type: 'user', text: 'hi via proxy' })
   })
 
-  it('unauthorized proxy call returns 401 without touching client', async () => {
+  it('unauthorized proxy call returns 401 AND does not reach the client', async () => {
     h.clusterClient = createClusterClient({
       serverUrl: h.serverUrl,
       clusterToken: CLUSTER_TOKEN,
@@ -340,11 +378,57 @@ describe('cluster E2E (2 machines in-process)', () => {
     })
     await h.clusterClient.start()
 
+    expect(h.clientPM.startCalls).toHaveLength(0)
     const res = await fetch(`${h.serverUrl}/cluster/action`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }, // no auth
       body: JSON.stringify({ machineId: h.clientId, action: 'start_session' }),
     })
     expect(res.status).toBe(401)
+    // Downstream: client's PM must NOT have been called
+    expect(h.clientPM.startCalls).toHaveLength(0)
+  })
+
+  it('GET /cluster/stream proxies SSE frames from client to caller', async () => {
+    h.clusterClient = createClusterClient({
+      serverUrl: h.serverUrl,
+      clusterToken: CLUSTER_TOKEN,
+      machineId: h.clientId,
+      machineName: 'E2E Client',
+      selfUrl: h.clientUrl,
+      sessionToken: h.clientSessionToken,
+      heartbeatIntervalMs: 60_000,
+    })
+    await h.clusterClient.start()
+
+    // Kick off a stream request
+    const controller = new AbortController()
+    const streamRespPromise = fetch(`${h.serverUrl}/cluster/stream?machineId=${h.clientId}&token=${CLUSTER_TOKEN}`, {
+      signal: controller.signal,
+    })
+
+    // Broadcast a frame on the client's SSE writer — it should arrive via proxy
+    await new Promise((r) => setTimeout(r, 50))
+    h.clientSseWriter.broadcast(42, JSON.stringify({ type: 'system', subtype: 'init', hello: 'proxy' }))
+
+    const streamResp = await streamRespPromise
+    expect(streamResp.status).toBe(200)
+    expect(streamResp.headers.get('content-type')).toMatch(/text\/event-stream/)
+
+    // Read some bytes from the stream
+    const reader = streamResp.body!.getReader()
+    const decoder = new TextDecoder()
+    let buffered = ''
+    const deadline = Date.now() + 2000
+    while (!buffered.includes('proxy') && Date.now() < deadline) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffered += decoder.decode(value, { stream: true })
+    }
+    expect(buffered).toContain('"hello":"proxy"')
+
+    // Clean up — abort the stream
+    controller.abort()
+    try { await reader.cancel() } catch { /* already cancelling */ }
   })
 })
