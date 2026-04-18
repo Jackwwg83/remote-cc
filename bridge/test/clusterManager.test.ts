@@ -461,6 +461,35 @@ describe('persistence round-trip', () => {
     expect(parsed.machines['client-a']).toBeDefined()
   })
 
+  it('serializes concurrent persist writes — no overlap, final file matches in-memory state', async () => {
+    const mgr = await createClusterManager({
+      persistPath: tmpFile,
+      persistDebounceMs: 5, // very short so each change flushes before next
+    })
+
+    // Fire 20 rapid registers — each schedules a persist
+    for (let i = 0; i < 20; i++) {
+      mgr.register(makeRegReq({ machineId: `m${i}`, name: `M${i}` }))
+    }
+
+    // Wait for all writes to flush via close()
+    await mgr.close()
+
+    // File should exist with all 20 machines
+    const raw = await readFile(tmpFile, 'utf8')
+    const parsed = JSON.parse(raw)
+    expect(parsed.version).toBe(1)
+    expect(Object.keys(parsed.machines)).toHaveLength(20)
+
+    // No tmp files left around in the directory
+    const { readdir } = await import('node:fs/promises')
+    const { dirname, basename } = await import('node:path')
+    const files = await readdir(dirname(tmpFile))
+    const persistBasename = basename(tmpFile)
+    const tmpLeftovers = files.filter((f) => f.startsWith(`${persistBasename}.tmp.`))
+    expect(tmpLeftovers).toEqual([])
+  })
+
   it('ignores persisted entry that shadows current self machineId', async () => {
     // Pretend an old server run persisted "srv" as a regular machine
     const { writeFile, mkdir } = await import('node:fs/promises')
