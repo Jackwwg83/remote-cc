@@ -16,22 +16,40 @@ const MACHINE_ID_FILE = join(MACHINE_DIR, 'machine-id')
 // Strict UUID v4: 8-4-4-4-12 hex, version nibble=4, variant=8|9|a|b
 const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
+/** Invalid content marker — file exists with non-UUID content that looks complete. */
+export class CorruptMachineIdError extends Error {
+  constructor(public readonly content: string) {
+    super(`Invalid machine-id in ${MACHINE_ID_FILE}: ${JSON.stringify(content)}`)
+    this.name = 'CorruptMachineIdError'
+  }
+}
+
+/**
+ * Returns:
+ *   - valid UUID v4 string → file has a complete valid ID
+ *   - null → file missing OR appears to be mid-write (partial contents)
+ *   - throws CorruptMachineIdError → file has non-UUID content that is clearly
+ *     not a partial write (long enough to be "final" but wrong shape)
+ */
 async function readValid(): Promise<string | null> {
+  let content: string
   try {
-    const content = await readFile(MACHINE_ID_FILE, 'utf8')
-    const id = content.trim()
-    if (UUID_V4_REGEX.test(id)) return id
-    if (id === '') return null // treat empty as "not yet written" — caller retries
-    // non-empty + invalid → corruption; don't silently overwrite
-    throw new Error(
-      `Invalid machine-id in ${MACHINE_ID_FILE}: ${JSON.stringify(id)}. ` +
-      `Delete the file manually if you want to regenerate.`,
-    )
+    content = await readFile(MACHINE_ID_FILE, 'utf8')
   } catch (err: unknown) {
     const e = err as NodeJS.ErrnoException
     if (e.code === 'ENOENT') return null
     throw err
   }
+
+  const id = content.trim()
+  if (UUID_V4_REGEX.test(id)) return id
+
+  // Heuristic: a valid entry is exactly 36 chars after trim. Anything shorter
+  // is treated as a partial write (retryable). Anything else looks like a
+  // complete-but-wrong file (corruption).
+  if (id.length < 36) return null
+
+  throw new CorruptMachineIdError(id)
 }
 
 export async function getOrCreateMachineId(): Promise<string> {
@@ -74,21 +92,27 @@ export async function getOrCreateMachineId(): Promise<string> {
       }
       if (e.code === 'EPERM' || e.code === 'ENOSYS' || e.code === 'EOPNOTSUPP') {
         // Filesystem doesn't support hardlinks. Fall back to writeFile('wx')
-        // on the target directly. The empty-file window exists here, but on
-        // filesystems that lack link() it's the best we can do.
+        // on the target directly. There IS a partial-write window here
+        // between create and complete write; we make readValid() tolerant
+        // of partial content (returns null for content < 36 chars).
         try {
           await writeFile(MACHINE_ID_FILE, id + '\n', { flag: 'wx' })
           return id
         } catch (err2: unknown) {
           const e2 = err2 as NodeJS.ErrnoException
           if (e2.code !== 'EEXIST') throw err2
-          // Someone else got there — read winner with retries
-          for (let attempt = 0; attempt < 20; attempt++) {
-            const winner = await readValid()
-            if (winner) return winner
+          // Someone else got there. Poll with tolerance for partial reads.
+          for (let attempt = 0; attempt < 40; attempt++) {
+            try {
+              const winner = await readValid()
+              if (winner) return winner
+            } catch (err3: unknown) {
+              if (err3 instanceof CorruptMachineIdError) throw err3
+              // other errors: retry
+            }
             await sleepMs(25)
           }
-          throw new Error(`Raced on machine-id creation (fallback) but could not read winner`)
+          throw new Error(`Raced on machine-id creation (fallback) but could not read winner after 1s`)
         }
       }
       throw err
