@@ -403,17 +403,24 @@ describe('cluster E2E (2 machines in-process)', () => {
 
     // Kick off a stream request
     const controller = new AbortController()
-    const streamRespPromise = fetch(`${h.serverUrl}/cluster/stream?machineId=${h.clientId}&token=${CLUSTER_TOKEN}`, {
+    const streamResp = await fetch(`${h.serverUrl}/cluster/stream?machineId=${h.clientId}&token=${CLUSTER_TOKEN}`, {
       signal: controller.signal,
     })
-
-    // Broadcast a frame on the client's SSE writer — it should arrive via proxy
-    await new Promise((r) => setTimeout(r, 50))
-    h.clientSseWriter.broadcast(42, JSON.stringify({ type: 'system', subtype: 'init', hello: 'proxy' }))
-
-    const streamResp = await streamRespPromise
     expect(streamResp.status).toBe(200)
     expect(streamResp.headers.get('content-type')).toMatch(/text\/event-stream/)
+
+    // Wait for the proxy's fetch to actually land on the client's SSE
+    // endpoint before broadcasting. sseWriter.broadcast() only writes to
+    // currently-connected clients — without this readiness check, the
+    // broadcast could race ahead of the proxy attach and be dropped.
+    const attachDeadline = Date.now() + 2000
+    while (h.clientSseWriter.clientCount() === 0 && Date.now() < attachDeadline) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(h.clientSseWriter.clientCount()).toBeGreaterThan(0)
+
+    // Now the broadcast is guaranteed to reach the proxy
+    h.clientSseWriter.broadcast(42, JSON.stringify({ type: 'system', subtype: 'init', hello: 'proxy' }))
 
     // Read some bytes from the stream
     const reader = streamResp.body!.getReader()
