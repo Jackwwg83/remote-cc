@@ -7,17 +7,17 @@
  * "disconnected" final state), falls back to routing through the cluster
  * server's /cluster/stream + /cluster/message proxy endpoints.
  *
- * Design:
- *   - Single facade that mimics the connectTransport() return shape so App.tsx
- *     can swap in with minimal changes.
- *   - Keeps lastSeq across a direct→proxy switch so the server proxy's
- *     forwarded Last-Event-ID replays from where direct left off.
- *   - No automatic fallback back to direct once in proxy mode — the UI can
- *     call retryDirect() explicitly after a network change.
+ * Implementation notes:
+ *   - Uses connectTransport's ssePath/postPath/extraQuery options so proxy
+ *     mode actually hits /cluster/stream + /cluster/message (not /events/stream)
+ *   - Propagates lastSeq from the dying inner transport into the new one via
+ *     initialSeq, so the proxy's Last-Event-ID forwarding resumes correctly
+ *   - Version-gates inner transport callbacks: stale events from a closed
+ *     inner are discarded even if they race after close()
  */
 
 import { connectTransport } from './transport.js'
-import type { TransportState, ReconnectMeta } from './transport.js'
+import type { TransportState, ReconnectMeta, TransportOptions } from './transport.js'
 
 export type TransportMode = 'direct' | 'proxy'
 
@@ -68,36 +68,35 @@ export function connectMachineTransport(opts: MachineTransportOptions): MachineT
   let currentState: MachineTransportState = 'connecting'
   let mode: TransportMode = 'direct'
   let inner: InnerTransport | null = null
+  let innerVersion = 0
   let closed = false
   let directFailures = 0
-  let lastSeq = 0
-
-  function buildProxyUrl(): string {
-    const u = new URL('/cluster/stream', opts.serverUrl)
-    u.searchParams.set('machineId', opts.machineId)
-    u.searchParams.set('token', opts.clusterToken)
-    return u.toString()
-  }
+  /** Cached seq across switches (survives inner.close()). */
+  let cachedSeq = 0
 
   function notifyState(state: MachineTransportState, meta?: ReconnectMeta) {
     currentState = state
     for (const cb of stateCallbacks) {
-      try { cb(state, meta ? { ...meta, mode } : { attempt: 0, maxAttempts: 0, mode }) } catch { /* swallow */ }
+      try {
+        cb(state, meta ? { ...meta, mode } : { attempt: 0, maxAttempts: 0, mode })
+      } catch { /* swallow */ }
     }
   }
 
-  function attach(t: InnerTransport): void {
+  function attach(t: InnerTransport, version: number): void {
     t.onMessage((msg) => {
+      // Discard messages from a retired inner transport
+      if (version !== innerVersion || closed) return
+      cachedSeq = t.getLastSeq()
       for (const cb of messageCallbacks) {
         try { cb(msg) } catch { /* swallow */ }
       }
     })
     t.onStateChange((state, meta) => {
-      // Keep lastSeq in sync for potential fallback replay
-      lastSeq = t.getLastSeq()
+      if (version !== innerVersion || closed) return
+      cachedSeq = t.getLastSeq()
 
       if (state === 'disconnected' && mode === 'direct' && !closed) {
-        // Direct path gave up — switch to proxy
         directFailures = maxDirectFailures
         switchToProxy()
         return
@@ -120,27 +119,48 @@ export function connectMachineTransport(opts: MachineTransportOptions): MachineT
     if (closed) return
     mode = 'direct'
     directFailures = 0
-    inner = factory(opts.directUrl)
-    attach(inner)
+    innerVersion++
+    // Direct hits the machine's /events/stream + /messages with its
+    // sessionToken — defaults are fine, just pass initialSeq for replay.
+    const directOpts: TransportOptions = {}
+    if (cachedSeq > 0) directOpts.initialSeq = cachedSeq
+    inner = factory(opts.directUrl, directOpts)
+    attach(inner, innerVersion)
+  }
+
+  function openProxy(): void {
+    if (closed) return
+    mode = 'proxy'
+    innerVersion++
+    // Proxy mode: SSE goes to /cluster/stream?machineId=X, POST goes to
+    // /cluster/message?machineId=X, all under the server's origin with
+    // cluster token as bearer.
+    const proxyBase = `${opts.serverUrl}${opts.serverUrl.includes('?') ? '&' : '?'}token=${encodeURIComponent(opts.clusterToken)}`
+    const proxyOpts: TransportOptions = {
+      ssePath: '/cluster/stream',
+      postPath: '/cluster/message',
+      extraQuery: { machineId: opts.machineId },
+    }
+    if (cachedSeq > 0) proxyOpts.initialSeq = cachedSeq
+    inner = factory(proxyBase, proxyOpts)
+    attach(inner, innerVersion)
   }
 
   function switchToProxy(): void {
     if (closed || mode === 'proxy') return
     const prev = inner
-    inner = null
-    mode = 'proxy'
-    // Wait a tick for the old transport's close() so lastSeq is captured,
-    // then open a new proxy-mode transport.
+    // Bump version first so any late callbacks from prev are ignored
+    innerVersion++
     try { prev?.close() } catch { /* ignore */ }
-    inner = factory(buildProxyUrl())
-    attach(inner)
+    // Re-open as proxy (also bumps version but that's fine)
+    openProxy()
   }
 
   function retryDirect(): void {
     if (closed) return
     if (mode === 'direct') return
     const prev = inner
-    inner = null
+    innerVersion++
     try { prev?.close() } catch { /* ignore */ }
     openDirect()
   }
@@ -151,10 +171,8 @@ export function connectMachineTransport(opts: MachineTransportOptions): MachineT
   return {
     get mode(): TransportMode { return mode },
     send(msg: unknown): Promise<boolean> {
-      if (!inner) return Promise.resolve(false)
-      if (mode === 'direct') return inner.send(msg)
-      // Proxy mode: send via server's /cluster/message
-      return sendViaProxy(opts.serverUrl, opts.clusterToken, opts.machineId, msg)
+      if (!inner || closed) return Promise.resolve(false)
+      return inner.send(msg)
     },
     onMessage(cb) { messageCallbacks.push(cb) },
     onStateChange(cb) {
@@ -165,41 +183,12 @@ export function connectMachineTransport(opts: MachineTransportOptions): MachineT
     switchToProxy,
     close(): void {
       closed = true
+      innerVersion++
       try { inner?.close() } catch { /* ignore */ }
       inner = null
     },
     getLastSeq(): number {
-      return inner?.getLastSeq() ?? lastSeq
+      return inner?.getLastSeq() ?? cachedSeq
     },
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Proxy POST helper
-// ---------------------------------------------------------------------------
-
-async function sendViaProxy(
-  serverUrl: string,
-  clusterToken: string,
-  machineId: string,
-  msg: unknown,
-): Promise<boolean> {
-  const u = new URL('/cluster/message', serverUrl)
-  u.searchParams.set('machineId', machineId)
-  const body = typeof msg === 'object' && msg !== null
-    ? { ...msg, _messageId: crypto.randomUUID() }
-    : { payload: msg, _messageId: crypto.randomUUID() }
-  try {
-    const res = await fetch(u.toString(), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${clusterToken}`,
-      },
-      body: JSON.stringify(body),
-    })
-    return res.ok
-  } catch {
-    return false
   }
 }
