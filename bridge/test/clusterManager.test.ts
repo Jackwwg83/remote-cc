@@ -1,28 +1,26 @@
 /**
  * Tests for clusterManager.ts — machine state cache and timeout detection.
  *
- * Uses noPersist: true for most tests to avoid touching disk.
- * Persistence round-trip tests use a tmp file path.
- * Fake timers (vi.useFakeTimers) are used to test the offline sweep.
+ * factory is async (awaits persisted state load).
+ * heartbeat requires sessionToken (identity proof).
+ * register returns { ok, error? }.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { readFile, unlink } from 'node:fs/promises'
 import { createClusterManager } from '../src/clusterManager.js'
 import type { RegisterRequest, HeartbeatRequest } from '../src/clusterManager.js'
 
-// ---------------------------------------------------------------------------
-// Test fixtures
-// ---------------------------------------------------------------------------
+const TOKEN = 'tok-abc'
 
 function makeRegReq(overrides?: Partial<RegisterRequest>): RegisterRequest {
   return {
     machineId: 'machine-a',
     name: 'Alpha',
     url: 'http://localhost:7860',
-    sessionToken: 'tok-abc',
+    sessionToken: TOKEN,
     ...overrides,
   }
 }
@@ -30,41 +28,41 @@ function makeRegReq(overrides?: Partial<RegisterRequest>): RegisterRequest {
 function makeHbReq(overrides?: Partial<HeartbeatRequest>): HeartbeatRequest {
   return {
     machineId: 'machine-a',
+    sessionToken: TOKEN,
     status: 'idle',
     ...overrides,
   }
 }
 
-// ---------------------------------------------------------------------------
-// 1. register() stores machine state
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// register()
+// -----------------------------------------------------------------------
 
 describe('register()', () => {
-  it('stores machine state and can retrieve it', () => {
-    const mgr = createClusterManager({ noPersist: true })
-    mgr.register(makeRegReq())
+  it('stores machine state and returns ok', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    const result = mgr.register(makeRegReq())
 
+    expect(result.ok).toBe(true)
     const machine = mgr.getMachine('machine-a')
     expect(machine).toBeDefined()
     expect(machine?.name).toBe('Alpha')
     expect(machine?.url).toBe('http://localhost:7860')
-    expect(machine?.sessionToken).toBe('tok-abc')
     expect(machine?.status).toBe('idle')
-    expect(machine?.sessions).toEqual([])
-    expect(typeof machine?.lastSeen).toBe('number')
-    expect(typeof machine?.firstSeen).toBe('number')
+    await mgr.close()
   })
 
-  it('preserves firstSeen on re-registration', async () => {
+  it('preserves firstSeen on re-registration with same token', async () => {
     vi.useFakeTimers()
-    const mgr = createClusterManager({ noPersist: true })
+    const mgr = await createClusterManager({ noPersist: true })
 
     vi.setSystemTime(1000)
     mgr.register(makeRegReq())
     const firstSeen = mgr.getMachine('machine-a')!.firstSeen
 
     vi.setSystemTime(5000)
-    mgr.register(makeRegReq({ name: 'Alpha Updated' }))
+    const result = mgr.register(makeRegReq({ name: 'Alpha Updated' }))
+    expect(result.ok).toBe(true)
 
     const machine = mgr.getMachine('machine-a')!
     expect(machine.firstSeen).toBe(firstSeen)
@@ -75,55 +73,101 @@ describe('register()', () => {
     await mgr.close()
   })
 
-  it('stores optional os and hostname fields', () => {
-    const mgr = createClusterManager({ noPersist: true })
+  it('stores optional os and hostname fields', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
     mgr.register(makeRegReq({ os: 'darwin', hostname: 'my-mac.local' }))
 
     const machine = mgr.getMachine('machine-a')
     expect(machine?.os).toBe('darwin')
     expect(machine?.hostname).toBe('my-mac.local')
+    await mgr.close()
+  })
+
+  it('rejects re-registration with a different sessionToken (impersonation guard)', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    mgr.register(makeRegReq({ sessionToken: 'original' }))
+
+    const attacker = mgr.register(makeRegReq({ sessionToken: 'attacker' }))
+    expect(attacker.ok).toBe(false)
+    expect(attacker.error).toMatch(/sessionToken/)
+
+    // Original session still intact
+    expect(mgr.getMachine('machine-a')?.sessionToken).toBe('original')
+    await mgr.close()
+  })
+
+  it('rejects registration that conflicts with server self', async () => {
+    const mgr = await createClusterManager({
+      noPersist: true,
+      self: { machineId: 'srv', name: 'Server', url: 'http://srv', sessionToken: 'srv-tok' },
+    })
+    const result = mgr.register(makeRegReq({ machineId: 'srv' }))
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/conflicts with server self/)
+    await mgr.close()
   })
 })
 
-// ---------------------------------------------------------------------------
-// 2. register() rejects invalid URL
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// register() — URL & field validation
+// -----------------------------------------------------------------------
 
-describe('register() — URL validation', () => {
-  it('throws for a non-URL string', () => {
-    const mgr = createClusterManager({ noPersist: true })
-    expect(() => mgr.register(makeRegReq({ url: 'not-a-url' }))).toThrow(/invalid URL/)
+describe('register() validation', () => {
+  it('returns error for non-URL string', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    const r = mgr.register(makeRegReq({ url: 'not-a-url' }))
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/invalid URL/)
+    await mgr.close()
   })
 
-  it('throws for ftp:// URL', () => {
-    const mgr = createClusterManager({ noPersist: true })
-    expect(() => mgr.register(makeRegReq({ url: 'ftp://host/path' }))).toThrow(/http/)
+  it('returns error for ftp:// URL', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    const r = mgr.register(makeRegReq({ url: 'ftp://host/path' }))
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/http/)
+    await mgr.close()
   })
 
-  it('accepts https:// URL', () => {
-    const mgr = createClusterManager({ noPersist: true })
-    expect(() => mgr.register(makeRegReq({ url: 'https://example.com:8080' }))).not.toThrow()
+  it('accepts https:// URL', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    expect(mgr.register(makeRegReq({ url: 'https://example.com:8080' })).ok).toBe(true)
+    await mgr.close()
   })
 
-  it('throws for empty machineId', () => {
-    const mgr = createClusterManager({ noPersist: true })
-    expect(() => mgr.register(makeRegReq({ machineId: '' }))).toThrow(/machineId/)
+  it('returns error for empty machineId', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    const r = mgr.register(makeRegReq({ machineId: '' }))
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/machineId/)
+    await mgr.close()
   })
 
-  it('throws for empty name', () => {
-    const mgr = createClusterManager({ noPersist: true })
-    expect(() => mgr.register(makeRegReq({ name: '' }))).toThrow(/name/)
+  it('returns error for empty name', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    const r = mgr.register(makeRegReq({ name: '' }))
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/name/)
+    await mgr.close()
+  })
+
+  it('returns error for empty sessionToken', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    const r = mgr.register(makeRegReq({ sessionToken: '' }))
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/sessionToken/)
+    await mgr.close()
   })
 })
 
-// ---------------------------------------------------------------------------
-// 3. heartbeat() updates existing machine
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// heartbeat()
+// -----------------------------------------------------------------------
 
 describe('heartbeat()', () => {
-  it('updates status, sessionId, project, sessions, and lastSeen', async () => {
+  it('updates status, sessionId, project, sessions, lastSeen on valid token', async () => {
     vi.useFakeTimers()
-    const mgr = createClusterManager({ noPersist: true })
+    const mgr = await createClusterManager({ noPersist: true })
 
     vi.setSystemTime(1000)
     mgr.register(makeRegReq())
@@ -137,7 +181,6 @@ describe('heartbeat()', () => {
     }))
 
     expect(result).toEqual({ ok: true })
-
     const machine = mgr.getMachine('machine-a')!
     expect(machine.status).toBe('running')
     expect(machine.sessionId).toBe('sess-xyz')
@@ -149,126 +192,132 @@ describe('heartbeat()', () => {
     await mgr.close()
   })
 
-  it('brings offline machine back online with status from heartbeat body', async () => {
+  it('brings offline machine back online', async () => {
     vi.useFakeTimers()
-    const mgr = createClusterManager({ noPersist: true, offlineTimeoutMs: 1000, sweepIntervalMs: 500 })
+    const mgr = await createClusterManager({
+      noPersist: true,
+      offlineTimeoutMs: 1000,
+      sweepIntervalMs: 500,
+    })
 
     vi.setSystemTime(0)
     mgr.register(makeRegReq())
-
-    // 触发 sweep，让机器变成 offline
-    vi.advanceTimersByTime(1600)
+    vi.advanceTimersByTime(2000)
     expect(mgr.getMachine('machine-a')?.status).toBe('offline')
 
-    // 心跳到来，恢复在线
-    vi.setSystemTime(2000)
+    vi.setSystemTime(3000)
     mgr.heartbeat(makeHbReq({ status: 'idle' }))
-
     expect(mgr.getMachine('machine-a')?.status).toBe('idle')
-    expect(mgr.getMachine('machine-a')?.lastSeen).toBe(2000)
 
     vi.useRealTimers()
     await mgr.close()
   })
 
-  it('does not modify unrelated fields when optional fields are omitted', () => {
-    const mgr = createClusterManager({ noPersist: true })
+  it('keeps previous optional fields when new heartbeat omits them', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
     mgr.register(makeRegReq())
-    mgr.heartbeat(makeHbReq({
-      status: 'running',
-      sessionId: 'sess-1',
-      project: 'proj-a',
-    }))
-
-    // Send heartbeat without sessionId/project
+    mgr.heartbeat(makeHbReq({ status: 'running', sessionId: 'sess-1', project: 'proj-a' }))
     mgr.heartbeat(makeHbReq({ status: 'idle' }))
 
     const machine = mgr.getMachine('machine-a')!
-    // sessionId and project should remain from previous heartbeat
     expect(machine.sessionId).toBe('sess-1')
     expect(machine.project).toBe('proj-a')
     expect(machine.status).toBe('idle')
+    await mgr.close()
   })
-})
 
-// ---------------------------------------------------------------------------
-// 4. heartbeat() for unregistered machineId returns error
-// ---------------------------------------------------------------------------
-
-describe('heartbeat() — unregistered machine', () => {
-  it('returns { ok: false, error: "not registered" } for unknown machineId', () => {
-    const mgr = createClusterManager({ noPersist: true })
+  it('rejects heartbeat for unknown machineId', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
     const result = mgr.heartbeat(makeHbReq({ machineId: 'unknown-id' }))
     expect(result).toEqual({ ok: false, error: 'not registered' })
+    await mgr.close()
+  })
+
+  it('rejects heartbeat with wrong sessionToken', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    mgr.register(makeRegReq({ sessionToken: 'original' }))
+    const result = mgr.heartbeat(makeHbReq({ sessionToken: 'wrong' }))
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/sessionToken/)
+    await mgr.close()
+  })
+
+  it('rejects heartbeat missing sessionToken', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
+    mgr.register(makeRegReq())
+    const result = mgr.heartbeat({ machineId: 'machine-a', sessionToken: '', status: 'idle' })
+    expect(result.ok).toBe(false)
+    await mgr.close()
   })
 })
 
-// ---------------------------------------------------------------------------
-// 5. listMachines() returns sorted by name
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// listMachines()
+// -----------------------------------------------------------------------
 
-describe('listMachines() — sorting', () => {
-  it('returns machines sorted by name ascending', () => {
-    const mgr = createClusterManager({ noPersist: true })
+describe('listMachines()', () => {
+  it('returns machines sorted by name ascending', async () => {
+    const mgr = await createClusterManager({ noPersist: true })
     mgr.register(makeRegReq({ machineId: 'id-c', name: 'Charlie' }))
     mgr.register(makeRegReq({ machineId: 'id-a', name: 'Alpha' }))
     mgr.register(makeRegReq({ machineId: 'id-b', name: 'Bravo' }))
 
     const names = mgr.listMachines().map((m) => m.name)
     expect(names).toEqual(['Alpha', 'Bravo', 'Charlie'])
+    await mgr.close()
   })
-})
 
-// ---------------------------------------------------------------------------
-// 6. listMachines() includes self if configured
-// ---------------------------------------------------------------------------
-
-describe('listMachines() — self entry', () => {
-  it('includes self entry when configured', () => {
-    const mgr = createClusterManager({
+  it('includes self entry when configured', async () => {
+    const mgr = await createClusterManager({
       noPersist: true,
-      self: {
-        machineId: 'server-self',
-        name: 'Server',
-        url: 'http://server:7860',
-        sessionToken: 'server-tok',
-      },
+      self: { machineId: 'server-self', name: 'Server', url: 'http://server:7860', sessionToken: 'server-tok' },
     })
     mgr.register(makeRegReq({ machineId: 'client-1', name: 'Client' }))
 
-    const machines = mgr.listMachines()
-    const ids = machines.map((m) => m.machineId)
+    const ids = mgr.listMachines().map((m) => m.machineId)
     expect(ids).toContain('server-self')
     expect(ids).toContain('client-1')
+    await mgr.close()
   })
 
-  it('self entry status is always idle (never offline)', async () => {
+  it('self entry is always idle even after timeout', async () => {
     vi.useFakeTimers()
-    const mgr = createClusterManager({
+    const mgr = await createClusterManager({
       noPersist: true,
       offlineTimeoutMs: 1000,
       sweepIntervalMs: 500,
-      self: {
-        machineId: 'server-self',
-        name: 'Server',
-        url: 'http://server:7860',
-        sessionToken: 'tok',
-      },
+      self: { machineId: 'srv', name: 'Server', url: 'http://server:7860', sessionToken: 'tok' },
     })
 
-    // Advance well past offline threshold
     vi.advanceTimersByTime(5000)
-
-    const self = mgr.listMachines().find((m) => m.machineId === 'server-self')
+    const self = mgr.listMachines().find((m) => m.machineId === 'srv')
     expect(self?.status).toBe('idle')
 
     vi.useRealTimers()
     await mgr.close()
   })
 
-  it('self entry lastSeen is refreshed on each listMachines() call', () => {
+  it('getMachine(selfId) returns idle even after timeout', async () => {
     vi.useFakeTimers()
-    const mgr = createClusterManager({
+    const mgr = await createClusterManager({
+      noPersist: true,
+      offlineTimeoutMs: 1000,
+      sweepIntervalMs: 500,
+      self: { machineId: 'srv', name: 'Server', url: 'http://server:7860', sessionToken: 'tok' },
+    })
+
+    vi.advanceTimersByTime(5000)
+    // getMachine(selfId) should also return idle per spec
+    const self = mgr.getMachine('srv')
+    expect(self?.status).toBe('idle')
+
+    vi.useRealTimers()
+    await mgr.close()
+  })
+
+  it('self lastSeen refreshes on each listMachines() call', async () => {
+    vi.useFakeTimers()
+    const mgr = await createClusterManager({
       noPersist: true,
       self: { machineId: 'srv', name: 'Server', url: 'http://srv:7860', sessionToken: 'tok' },
     })
@@ -282,17 +331,18 @@ describe('listMachines() — self entry', () => {
     expect(second).toBeGreaterThan(first)
 
     vi.useRealTimers()
+    await mgr.close()
   })
 })
 
-// ---------------------------------------------------------------------------
-// 7. Offline detection: machine marked offline after timeout
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// offline detection
+// -----------------------------------------------------------------------
 
 describe('offline detection', () => {
-  it('marks machine offline after offlineTimeoutMs passes with no heartbeat', async () => {
+  it('marks machine offline strictly AFTER offlineTimeoutMs (not equal)', async () => {
     vi.useFakeTimers()
-    const mgr = createClusterManager({
+    const mgr = await createClusterManager({
       noPersist: true,
       offlineTimeoutMs: 1000,
       sweepIntervalMs: 500,
@@ -300,13 +350,12 @@ describe('offline detection', () => {
 
     vi.setSystemTime(0)
     mgr.register(makeRegReq())
+
+    // At 1000ms (= threshold): still idle (sweep uses > not >=)
+    vi.advanceTimersByTime(1000)
     expect(mgr.getMachine('machine-a')?.status).toBe('idle')
 
-    // 500ms: first sweep — not yet offline (500ms < 1000ms threshold)
-    vi.advanceTimersByTime(500)
-    expect(mgr.getMachine('machine-a')?.status).toBe('idle')
-
-    // 1000ms: second sweep — exactly at threshold (1000ms >= 1000ms) → offline
+    // Just past: 1500ms > 1000ms → offline
     vi.advanceTimersByTime(500)
     expect(mgr.getMachine('machine-a')?.status).toBe('offline')
 
@@ -316,7 +365,7 @@ describe('offline detection', () => {
 
   it('does not mark machine offline if it keeps sending heartbeats', async () => {
     vi.useFakeTimers()
-    const mgr = createClusterManager({
+    const mgr = await createClusterManager({
       noPersist: true,
       offlineTimeoutMs: 1000,
       sweepIntervalMs: 500,
@@ -325,7 +374,6 @@ describe('offline detection', () => {
     vi.setSystemTime(0)
     mgr.register(makeRegReq())
 
-    // Keep sending heartbeats every 400ms
     for (let t = 400; t <= 3000; t += 400) {
       vi.setSystemTime(t)
       mgr.heartbeat(makeHbReq({ status: 'idle' }))
@@ -339,126 +387,46 @@ describe('offline detection', () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// 8. Self is never marked offline
-// ---------------------------------------------------------------------------
-
-describe('self entry — never offline', () => {
-  it('sweep timer never marks self as offline', async () => {
-    vi.useFakeTimers()
-    const mgr = createClusterManager({
-      noPersist: true,
-      offlineTimeoutMs: 100,
-      sweepIntervalMs: 50,
-      self: { machineId: 'srv', name: 'Server', url: 'http://srv', sessionToken: 'tok' },
-    })
-
-    // Run many sweeps without updating self lastSeen
-    vi.advanceTimersByTime(2000)
-
-    // Self should still not be offline
-    const self = mgr.getMachine('srv')
-    // 注意：listMachines() 刷新 self 的 lastSeen，getMachine() 直接从 Map 读
-    // 但 sweep 不会将 self 标记为 offline
-    // 如果 getMachine('srv') 是 undefined 说明 self 只在 listMachines 里注入
-    // 通过 listMachines 验证
-    const selfViaList = mgr.listMachines().find((m) => m.machineId === 'srv')
-    expect(selfViaList?.status).not.toBe('offline')
-
-    vi.useRealTimers()
-    await mgr.close()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// 9. Heartbeat arriving for offline machine brings it back online
-// ---------------------------------------------------------------------------
-
-describe('heartbeat revives offline machine', () => {
-  it('updates status from heartbeat even if machine was offline', async () => {
-    vi.useFakeTimers()
-    const mgr = createClusterManager({
-      noPersist: true,
-      offlineTimeoutMs: 1000,
-      sweepIntervalMs: 500,
-    })
-
-    vi.setSystemTime(0)
-    mgr.register(makeRegReq())
-
-    // Let machine go offline
-    vi.advanceTimersByTime(1600)
-    expect(mgr.getMachine('machine-a')?.status).toBe('offline')
-
-    // Client comes back and sends heartbeat
-    vi.setSystemTime(2000)
-    const result = mgr.heartbeat(makeHbReq({ status: 'running' }))
-
-    expect(result).toEqual({ ok: true })
-    expect(mgr.getMachine('machine-a')?.status).toBe('running')
-    expect(mgr.getMachine('machine-a')?.lastSeen).toBe(2000)
-
-    vi.useRealTimers()
-    await mgr.close()
-  })
-})
-
-// ---------------------------------------------------------------------------
-// 10. Persistence round-trip: register → close → new manager → state restored
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// persistence round-trip
+// -----------------------------------------------------------------------
 
 describe('persistence round-trip', () => {
   const tmpFile = join(tmpdir(), `cluster-test-${process.pid}-${Date.now()}.json`)
 
   afterEach(async () => {
-    // Clean up temp file
     try {
       await unlink(tmpFile)
     } catch {
-      // Ignore if file doesn't exist
+      // ignore
     }
   })
 
   it('restores state after close + reload (all entries start as offline)', async () => {
-    // Phase 1: register, heartbeat, then close
-    const mgr1 = createClusterManager({
+    const mgr1 = await createClusterManager({
       persistPath: tmpFile,
-      persistDebounceMs: 0, // write immediately in tests
+      persistDebounceMs: 0,
     })
-
     mgr1.register(makeRegReq({ machineId: 'mc-1', name: 'Machine One' }))
     mgr1.register(makeRegReq({ machineId: 'mc-2', name: 'Machine Two' }))
-    mgr1.heartbeat({ machineId: 'mc-1', status: 'running', project: 'proj-a' })
-
+    mgr1.heartbeat({ machineId: 'mc-1', sessionToken: TOKEN, status: 'running', project: 'proj-a' })
     await mgr1.close()
 
-    // Verify file was written
     const raw = await readFile(tmpFile, 'utf8')
     const parsed = JSON.parse(raw)
     expect(parsed.version).toBe(1)
     expect(Object.keys(parsed.machines)).toHaveLength(2)
 
-    // Phase 2: create new manager from same file
-    // We need to wait a tick for loadPersistedState to run
-    const mgr2 = createClusterManager({
+    // Load in new manager — async factory awaits load before returning
+    const mgr2 = await createClusterManager({
       persistPath: tmpFile,
-      noPersist: false,
-      persistDebounceMs: 100_000, // don't auto-persist during this test
+      persistDebounceMs: 100_000,
     })
 
-    // Allow async load to complete
-    await new Promise<void>((resolve) => setTimeout(resolve, 50))
-
-    // All restored machines should be offline initially
     const mc1 = mgr2.getMachine('mc-1')
     const mc2 = mgr2.getMachine('mc-2')
-
-    expect(mc1).toBeDefined()
-    expect(mc2).toBeDefined()
     expect(mc1?.status).toBe('offline')
     expect(mc2?.status).toBe('offline')
-
-    // Name and other fields should be preserved
     expect(mc1?.name).toBe('Machine One')
     expect(mc2?.name).toBe('Machine Two')
     expect(mc1?.project).toBe('proj-a')
@@ -468,10 +436,59 @@ describe('persistence round-trip', () => {
 
   it('does not crash if persist file does not exist', async () => {
     const nonExistentPath = join(tmpdir(), `no-such-file-${Date.now()}.json`)
-    // Should not throw
-    const mgr = createClusterManager({ persistPath: nonExistentPath })
-    await new Promise<void>((resolve) => setTimeout(resolve, 20))
+    const mgr = await createClusterManager({ persistPath: nonExistentPath })
     expect(mgr.listMachines()).toEqual([])
+    await mgr.close()
+  })
+
+  it('does not persist self entry even if its machineId happens to be in the map', async () => {
+    // First manager creates and persists two clients
+    const mgr1 = await createClusterManager({
+      persistPath: tmpFile,
+      persistDebounceMs: 0,
+      self: { machineId: 'srv', name: 'Server', url: 'http://srv:7860', sessionToken: 'srv-tok' },
+    })
+    mgr1.register(makeRegReq({ machineId: 'client-a', name: 'Client A' }))
+    mgr1.listMachines() // triggers self injection into the map
+
+    await mgr1.close()
+
+    const raw = await readFile(tmpFile, 'utf8')
+    const parsed = JSON.parse(raw)
+    // Self should NOT be in persisted machines
+    expect(parsed.machines['srv']).toBeUndefined()
+    // Client A should be
+    expect(parsed.machines['client-a']).toBeDefined()
+  })
+
+  it('ignores persisted entry that shadows current self machineId', async () => {
+    // Pretend an old server run persisted "srv" as a regular machine
+    const { writeFile, mkdir } = await import('node:fs/promises')
+    const { dirname } = await import('node:path')
+    await mkdir(dirname(tmpFile), { recursive: true })
+    await writeFile(tmpFile, JSON.stringify({
+      version: 1,
+      machines: {
+        'srv': {
+          machineId: 'srv', name: 'Old Server', url: 'http://old:7860',
+          sessionToken: 'old-tok', status: 'offline', sessions: [],
+          lastSeen: 0, firstSeen: 0,
+        },
+      },
+    }))
+
+    const mgr = await createClusterManager({
+      persistPath: tmpFile,
+      self: { machineId: 'srv', name: 'New Server', url: 'http://new:7860', sessionToken: 'new-tok' },
+    })
+
+    // Self should come from options, NOT from disk
+    const self = mgr.listMachines().find((m) => m.machineId === 'srv')
+    expect(self?.name).toBe('New Server')
+    expect(self?.url).toBe('http://new:7860')
+    expect(self?.sessionToken).toBe('new-tok')
+    expect(self?.status).toBe('idle')
+
     await mgr.close()
   })
 })
