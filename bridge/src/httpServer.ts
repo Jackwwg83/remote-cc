@@ -22,6 +22,9 @@ import type { ProcessManager, ProcessState } from './processManager.js'
 import type { SessionInfo } from './sessionScanner.js'
 import type { ClaudeProcess, SpawnClaudeOptions } from './spawner.js'
 import { verifyToken } from './auth.js'
+import type { ClusterManager, MachineState } from './clusterManager.js'
+import type { ClusterProxy, ClusterActionRequest } from './clusterProxy.js'
+import { timingSafeEqual } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -65,6 +68,15 @@ export interface HttpServerDeps {
   recentMessageIds?: Set<string>
   /** This machine's ID (UUID) — exposed at GET /machine/info */
   machineId?: string
+  /** Cluster manager (server role only) — enables /cluster/* endpoints. */
+  clusterManager?: ClusterManager
+  /** Cluster proxy (server role only) — enables action/stream/message forwarding. */
+  clusterProxy?: ClusterProxy
+  /** Cluster token (server role only) — auth for /cluster/* endpoints.
+   *  Clients and UIs must present this via Authorization header or ?token=. */
+  clusterToken?: string
+  /** fetch impl used for aggregate /cluster/sessions?refresh=true. Injectable for tests. */
+  fetchImpl?: typeof fetch
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -158,6 +170,26 @@ async function tryServeStatic(urlPath: string, res: ServerResponse): Promise<boo
 // ---------------------------------------------------------------------------
 
 // Auth check delegates to shared verifyToken from auth.ts
+
+/** Timing-safe cluster token check. Accepts Authorization: Bearer or ?token=. */
+function verifyClusterToken(req: IncomingMessage, token: string | undefined): boolean {
+  if (!token) return false
+  const expected = Buffer.from(token, 'utf8')
+  const auth = req.headers['authorization']
+  if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
+    const presented = Buffer.from(auth.slice(7), 'utf8')
+    if (presented.length === expected.length && timingSafeEqual(presented, expected)) return true
+  }
+  try {
+    const url = new URL(req.url ?? '', `http://${req.headers.host ?? 'localhost'}`)
+    const q = url.searchParams.get('token')
+    if (q) {
+      const presented = Buffer.from(q, 'utf8')
+      if (presented.length === expected.length && timingSafeEqual(presented, expected)) return true
+    }
+  } catch { /* ignore */ }
+  return false
+}
 
 /** Max body size for POST requests (64 KiB — more than enough for JSON control messages). */
 const MAX_BODY_BYTES = 64 * 1024
@@ -431,6 +463,201 @@ async function handleRequestAsync(
       const message = err instanceof Error ? err.message : 'Spawn failed'
       sendJson(res, 409, { error: message })
     }
+    return
+  }
+
+  // -------------------------------------------------------------------------
+  // Cluster routes (server role only — require clusterManager + clusterToken)
+  // -------------------------------------------------------------------------
+
+  if (pathname.startsWith('/cluster/')) {
+    // All /cluster/* routes require cluster role + cluster token
+    if (!deps.clusterManager || !deps.clusterToken) {
+      sendJson(res, 404, { error: 'Cluster mode not enabled' })
+      return
+    }
+    if (!verifyClusterToken(req, deps.clusterToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
+
+    // Route: POST /cluster/register — client initial registration
+    if (method === 'POST' && pathname === '/cluster/register') {
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const result = deps.clusterManager.register({
+        machineId: String(body.machineId ?? ''),
+        name: String(body.name ?? ''),
+        url: String(body.url ?? ''),
+        sessionToken: String(body.sessionToken ?? ''),
+        os: typeof body.os === 'string' ? body.os : undefined,
+        hostname: typeof body.hostname === 'string' ? body.hostname : undefined,
+      })
+      sendJson(res, result.ok ? 200 : 400, result)
+      return
+    }
+
+    // Route: POST /cluster/heartbeat — client periodic heartbeat
+    if (method === 'POST' && pathname === '/cluster/heartbeat') {
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const result = deps.clusterManager.heartbeat({
+        machineId: String(body.machineId ?? ''),
+        sessionToken: String(body.sessionToken ?? ''),
+        status: (body.status ?? 'idle') as MachineState['status'],
+        sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+        project: typeof body.project === 'string' ? body.project : undefined,
+        sessions: Array.isArray(body.sessions) ? (body.sessions as SessionInfo[]) : undefined,
+      })
+      // 404 "not registered" triggers client re-register; 401 "sessionToken" → impersonation
+      const status = result.ok ? 200
+        : result.error === 'not registered' ? 404
+        : result.error?.includes('sessionToken') ? 401
+        : 400
+      sendJson(res, status, result)
+      return
+    }
+
+    // Route: GET /cluster/status — all machine states
+    if (method === 'GET' && pathname === '/cluster/status') {
+      sendJson(res, 200, { machines: deps.clusterManager.listMachines() })
+      return
+    }
+
+    // Route: GET /cluster/sessions[?refresh=true] — aggregate session list
+    if (method === 'GET' && pathname === '/cluster/sessions') {
+      const refresh = urlObj.searchParams.get('refresh') === 'true'
+      const machines = deps.clusterManager.listMachines()
+      const fetchImpl = deps.fetchImpl ?? fetch
+      type EnrichedSession = SessionInfo & {
+        machineId: string
+        machineName: string
+        machineStatus: MachineState['status']
+      }
+      const flatten: EnrichedSession[] = []
+
+      if (refresh) {
+        // Fan out to online machines' /sessions/history
+        const online = machines.filter((m) => m.status !== 'offline' && m.url && m.sessionToken)
+        const results = await Promise.all(online.map(async (m) => {
+          try {
+            const controller = new AbortController()
+            const timer = setTimeout(() => controller.abort(), 5000)
+            const resp = await fetchImpl(`${m.url.replace(/\/$/, '')}/sessions/history`, {
+              headers: { 'Authorization': `Bearer ${m.sessionToken}` },
+              signal: controller.signal,
+            })
+            clearTimeout(timer)
+            if (!resp.ok) return { m, sessions: [] as SessionInfo[] }
+            const j = await resp.json() as { sessions?: SessionInfo[] }
+            return { m, sessions: j.sessions ?? [] }
+          } catch {
+            return { m, sessions: [] as SessionInfo[] }
+          }
+        }))
+        for (const { m, sessions } of results) {
+          for (const s of sessions) {
+            flatten.push({ ...s, machineId: m.machineId, machineName: m.name, machineStatus: m.status })
+          }
+        }
+      } else {
+        // Use cached sessions from heartbeats
+        for (const m of machines) {
+          for (const s of m.sessions ?? []) {
+            flatten.push({ ...s, machineId: m.machineId, machineName: m.name, machineStatus: m.status })
+          }
+        }
+      }
+      // Sort by time desc (ISO strings sort lexicographically in reverse)
+      flatten.sort((a, b) => (b.time ?? '').localeCompare(a.time ?? ''))
+      sendJson(res, 200, { sessions: flatten })
+      return
+    }
+
+    // Route: POST /cluster/action — proxy start/stop to target machine
+    if (method === 'POST' && pathname === '/cluster/action') {
+      if (!deps.clusterProxy) {
+        sendJson(res, 503, { error: 'Cluster proxy not available' })
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const machineId = body.machineId
+      const action = body.action
+      if (typeof machineId !== 'string' || !machineId) {
+        sendJson(res, 400, { error: 'machineId (string) required' })
+        return
+      }
+      if (action !== 'start_session' && action !== 'stop_session') {
+        sendJson(res, 400, { error: 'action must be start_session or stop_session' })
+        return
+      }
+      const actionReq: ClusterActionRequest = {
+        machineId,
+        action,
+        sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+        cwd: typeof body.cwd === 'string' ? body.cwd : undefined,
+      }
+      const result = await deps.clusterProxy.forwardAction(actionReq)
+      sendJson(res, result.status, result.body)
+      return
+    }
+
+    // Route: GET /cluster/stream?machineId=X — SSE proxy
+    if (method === 'GET' && pathname === '/cluster/stream') {
+      if (!deps.clusterProxy) {
+        sendJson(res, 503, { error: 'Cluster proxy not available' })
+        return
+      }
+      const machineId = urlObj.searchParams.get('machineId') ?? ''
+      if (!machineId) {
+        sendJson(res, 400, { error: 'machineId query param required' })
+        return
+      }
+      await deps.clusterProxy.proxyStream(machineId, req, res)
+      return
+    }
+
+    // Route: POST /cluster/message?machineId=X — message proxy
+    if (method === 'POST' && pathname === '/cluster/message') {
+      if (!deps.clusterProxy) {
+        sendJson(res, 503, { error: 'Cluster proxy not available' })
+        return
+      }
+      const machineId = urlObj.searchParams.get('machineId') ?? ''
+      if (!machineId) {
+        sendJson(res, 400, { error: 'machineId query param required' })
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const result = await deps.clusterProxy.proxyMessage(machineId, body)
+      sendJson(res, result.status, result.body)
+      return
+    }
+
+    // Unknown /cluster/* route
+    sendJson(res, 404, { error: 'Unknown cluster route' })
     return
   }
 

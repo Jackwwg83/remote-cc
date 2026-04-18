@@ -38,6 +38,10 @@ import { loadClusterConfig, maskToken } from './clusterConfig.js'
 import type { ClusterConfig } from './clusterConfig.js'
 import { createClusterClient } from './clusterClient.js'
 import type { ClusterClient } from './clusterClient.js'
+import { createClusterManager } from './clusterManager.js'
+import type { ClusterManager } from './clusterManager.js'
+import { createClusterProxy } from './clusterProxy.js'
+import type { ClusterProxy } from './clusterProxy.js'
 import { platform as osPlatform, hostname as osHostname } from 'node:os'
 
 const { values: args } = parseArgs({
@@ -165,6 +169,27 @@ async function main() {
   let currentMessageHandler: ((msg: Record<string, unknown>) => boolean) | null = null
 
   // -----------------------------------------------------------------------
+  // 3b. If server role, create ClusterManager + ClusterProxy
+  // -----------------------------------------------------------------------
+  let clusterManager: ClusterManager | null = null
+  let clusterProxy: ClusterProxy | null = null
+  if (cluster.role === 'server') {
+    const selfUrl = `http://${osHostname()}:${port}`
+    clusterManager = await createClusterManager({
+      self: {
+        machineId: cluster.machineId,
+        name: cluster.machineName,
+        url: selfUrl,
+        sessionToken: token,
+        os: osPlatform(),
+        hostname: osHostname(),
+      },
+    })
+    clusterProxy = createClusterProxy({ cluster: clusterManager })
+    console.log('   Cluster manager started — accepting /cluster/* requests')
+  }
+
+  // -----------------------------------------------------------------------
   // 4. Start HTTP server with SSE + message deps
   // -----------------------------------------------------------------------
   const { server, url } = await startHttpServer(port, {
@@ -179,6 +204,9 @@ async function main() {
     },
     recentMessageIds,
     machineId: cluster.machineId,
+    clusterManager: clusterManager ?? undefined,
+    clusterProxy: clusterProxy ?? undefined,
+    clusterToken: cluster.role === 'server' ? cluster.clusterToken : undefined,
   })
 
   // -----------------------------------------------------------------------
@@ -224,6 +252,16 @@ async function main() {
     }
     process.on('SIGINT', () => void shutdown())
     process.on('SIGTERM', () => void shutdown())
+  }
+
+  // Server role: close cluster manager on shutdown (flushes persist chain)
+  if (clusterManager) {
+    const mgr = clusterManager
+    const shutdownServer = async (): Promise<void> => {
+      try { await mgr.close() } catch { /* best-effort */ }
+    }
+    process.on('SIGINT', () => void shutdownServer())
+    process.on('SIGTERM', () => void shutdownServer())
   }
 
   // -----------------------------------------------------------------------
