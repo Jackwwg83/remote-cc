@@ -21,6 +21,7 @@
  */
 
 import { parseArgs } from 'node:util'
+import { hostname } from 'node:os'
 import { startHttpServer } from './httpServer.js'
 import { createSseWriter } from './sseWriter.js'
 import { createLineReader, writeLine } from './lineReader.js'
@@ -34,6 +35,7 @@ import { createProcessManager } from './processManager.js'
 import { scanSessions } from './sessionScanner.js'
 import type { ClaudeProcess } from './spawner.js'
 import { readSessionHistory } from './sessionHistory.js'
+import { getOrCreateMachineId } from './machineId.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -44,6 +46,11 @@ const { values: args } = parseArgs({
     version: { type: 'boolean', short: 'v' },
     continue: { type: 'boolean', short: 'c' },
     resume: { type: 'string' },
+    role: { type: 'string' },              // 'server' | 'client' | 'standalone' (default)
+    server: { type: 'string' },            // URL of server when role=client
+    'server-token': { type: 'string' },   // cluster token when role=client
+    'machine-name': { type: 'string' },   // display name, defaults to os.hostname()
+    'cluster-token': { type: 'string' },  // cluster token when role=server (auto-gen if omitted)
   },
 })
 
@@ -67,12 +74,67 @@ Options:
   --local                 Direct connect mode via Tailscale (default)
   --help, -h              Show this help
   --version, -v           Show version
+
+Cluster Options:
+  --role <role>           server | client | standalone (default: standalone)
+  --server <url>          Server URL (required for --role client)
+  --server-token <token>  Cluster token (required for --role client)
+  --machine-name <name>   Display name (default: hostname)
+  --cluster-token <token> Cluster token for server mode (auto-generated if omitted)
   `)
   process.exit(0)
 }
 
+// Module-scoped cluster config — available to later modules (T-M02, T-M03, T-M04, etc.)
+export let clusterRole: 'server' | 'client' | 'standalone' = 'standalone'
+export let clusterMachineId: string = ''
+export let clusterMachineName: string = ''
+export let clusterToken: string | undefined
+export let clusterServerUrl: string | undefined
+export let clusterServerToken: string | undefined
+
 async function main() {
   const port = parseInt(args.port ?? '7860', 10)
+
+  // -----------------------------------------------------------------------
+  // 0-pre. Resolve role + cluster config
+  // -----------------------------------------------------------------------
+  const roleRaw = args.role ?? process.env.REMOTE_CC_ROLE ?? 'standalone'
+  if (!['server', 'client', 'standalone'].includes(roleRaw)) {
+    console.error(`Invalid role: ${roleRaw}. Must be server, client, or standalone.`)
+    process.exit(1)
+  }
+  clusterRole = roleRaw as 'server' | 'client' | 'standalone'
+
+  clusterMachineId = await getOrCreateMachineId()
+  clusterMachineName = args['machine-name'] ?? process.env.REMOTE_CC_MACHINE_NAME ?? hostname()
+
+  if (clusterRole === 'client') {
+    const serverUrl = args.server ?? process.env.REMOTE_CC_SERVER
+    const serverToken = args['server-token'] ?? process.env.REMOTE_CC_SERVER_TOKEN
+    if (!serverUrl || !serverToken) {
+      console.error('--role client requires --server <url> and --server-token <token>')
+      console.error('(or REMOTE_CC_SERVER + REMOTE_CC_SERVER_TOKEN env vars)')
+      process.exit(1)
+    }
+    clusterServerUrl = serverUrl
+    clusterServerToken = serverToken
+    console.log(`   Cluster role: client (connecting to ${serverUrl})`)
+    console.log(`   Machine: ${clusterMachineName} (${clusterMachineId.slice(0, 8)}...)`)
+  }
+
+  if (clusterRole === 'server') {
+    const providedToken = args['cluster-token'] ?? process.env.REMOTE_CC_CLUSTER_TOKEN
+    if (!providedToken) {
+      const { randomBytes } = await import('node:crypto')
+      clusterToken = 'rcc_cluster_' + randomBytes(32).toString('base64url')
+    } else {
+      clusterToken = providedToken
+    }
+    console.log(`   Cluster role: server`)
+    console.log(`   Machine: ${clusterMachineName} (${clusterMachineId.slice(0, 8)}...)`)
+    console.log(`   Cluster token: ${clusterToken}`)
+  }
 
   // -----------------------------------------------------------------------
   // 0. Claude CLI version compatibility check (non-blocking)
