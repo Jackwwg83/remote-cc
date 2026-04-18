@@ -5,7 +5,7 @@
  * Used as the cluster-wide routing key for multi-machine setups.
  */
 
-import { readFile, writeFile, rename, mkdir, unlink } from 'node:fs/promises'
+import { readFile, writeFile, link, mkdir, unlink } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -39,43 +39,69 @@ export async function getOrCreateMachineId(): Promise<string> {
   const existing = await readValid()
   if (existing) return existing
 
-  // 2. Create atomically:
-  //    write to a unique temp file, then rename() onto the target.
-  //    rename() is atomic on POSIX — the target either has the old file or
-  //    the new one, never an empty / partial file. If we lose the race, we
-  //    simply read the winner's value.
+  // 2. Create atomically via tmp-file + link():
+  //    link() is POSIX atomic — fails with EEXIST if target already exists.
+  //    Unlike rename(), it never overwrites. The winner gets target == their
+  //    ID. Any loser's link() call fails with EEXIST, and they read the
+  //    winner's value instead. No TOCTOU, no partial file visibility.
+  //
+  //    Non-POSIX fallback: a few filesystems (e.g. some exFAT mounts) don't
+  //    support hardlinks. In that case link() throws EPERM / ENOSYS and we
+  //    fall back to a best-effort writeFile('wx') + retry loop.
   await mkdir(MACHINE_DIR, { recursive: true })
   const id = randomUUID()
-  const tempPath = join(MACHINE_DIR, `machine-id.tmp.${process.pid}.${Date.now()}`)
+  const tempPath = join(MACHINE_DIR, `machine-id.tmp.${process.pid}.${Date.now()}.${randomUUID()}`)
 
   try {
-    // write to temp file fully
     await writeFile(tempPath, id + '\n', { flag: 'wx' })
+
     try {
-      // Linux/macOS: rename() is atomic and will overwrite the target.
-      // If another process already renamed a valid ID onto the target, we'll
-      // end up overwriting it with our own ID — but that's only possible if
-      // readValid() at step 1 was racing. To avoid overwriting, re-check and
-      // bail out if someone beat us to it.
-      const raced = await readValid()
-      if (raced) {
-        // Lost the race. Clean up our temp file and return the winner.
-        return raced
-      }
-      await rename(tempPath, MACHINE_ID_FILE)
+      await link(tempPath, MACHINE_ID_FILE)
+      // Winner path — target now exists with our ID.
       return id
-    } finally {
-      // If rename succeeded, temp file is gone (moved). If we returned `raced`
-      // above, temp file is orphaned — clean it up.
-      await removeIfExists(tempPath)
+    } catch (err: unknown) {
+      const e = err as NodeJS.ErrnoException
+      if (e.code === 'EEXIST') {
+        // Loser path — someone else got there first. Read winner's ID.
+        // Retry a few times in case winner is still writing (shouldn't happen
+        // with link() but defensive nonetheless).
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const winner = await readValid()
+          if (winner) return winner
+          await sleepMs(25)
+        }
+        throw new Error(`Raced on machine-id creation but could not read winner after retries`)
+      }
+      if (e.code === 'EPERM' || e.code === 'ENOSYS' || e.code === 'EOPNOTSUPP') {
+        // Filesystem doesn't support hardlinks. Fall back to writeFile('wx')
+        // on the target directly. The empty-file window exists here, but on
+        // filesystems that lack link() it's the best we can do.
+        try {
+          await writeFile(MACHINE_ID_FILE, id + '\n', { flag: 'wx' })
+          return id
+        } catch (err2: unknown) {
+          const e2 = err2 as NodeJS.ErrnoException
+          if (e2.code !== 'EEXIST') throw err2
+          // Someone else got there — read winner with retries
+          for (let attempt = 0; attempt < 20; attempt++) {
+            const winner = await readValid()
+            if (winner) return winner
+            await sleepMs(25)
+          }
+          throw new Error(`Raced on machine-id creation (fallback) but could not read winner`)
+        }
+      }
+      throw err
     }
-  } catch (err: unknown) {
+  } finally {
+    // Always clean up temp file (link() leaves it as a second name; removing
+    // the temp leaves only the target, which is now a regular file).
     await removeIfExists(tempPath)
-    // Retry path: if writeFile('wx') got EEXIST because we collided with our
-    // own previous leftover (extremely unlikely given pid+timestamp), bubble
-    // up. Real-world first-run race will be caught by the raced-check above.
-    throw err
   }
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms))
 }
 
 async function removeIfExists(p: string): Promise<void> {
