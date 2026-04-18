@@ -36,6 +36,9 @@ import type { ClaudeProcess } from './spawner.js'
 import { readSessionHistory } from './sessionHistory.js'
 import { loadClusterConfig, maskToken } from './clusterConfig.js'
 import type { ClusterConfig } from './clusterConfig.js'
+import { createClusterClient } from './clusterClient.js'
+import type { ClusterClient } from './clusterClient.js'
+import { platform as osPlatform, hostname as osHostname } from 'node:os'
 
 const { values: args } = parseArgs({
   options: {
@@ -185,6 +188,45 @@ async function main() {
   await printStartupBanner(url, port, token, tailscale)
 
   // -----------------------------------------------------------------------
+  // 5b. If running as cluster client, register + start heartbeats
+  // -----------------------------------------------------------------------
+  let clusterClient: ClusterClient | null = null
+  if (cluster.role === 'client' && cluster.serverUrl && cluster.serverToken) {
+    const selfUrl = `http://${osHostname()}:${port}`
+    clusterClient = createClusterClient({
+      serverUrl: cluster.serverUrl,
+      clusterToken: cluster.serverToken,
+      machineId: cluster.machineId,
+      machineName: cluster.machineName,
+      selfUrl,
+      sessionToken: token,
+      os: osPlatform(),
+      hostname: osHostname(),
+    })
+    try {
+      await clusterClient.start()
+      console.log(`   Registered with cluster server at ${cluster.serverUrl}`)
+    } catch (err) {
+      console.error(`   Cluster registration failed: ${(err as Error).message}`)
+      console.error('   Bridge will continue in standalone mode.')
+      clusterClient = null
+    }
+
+    // Graceful shutdown — close client on SIGINT/SIGTERM
+    const shutdown = async (): Promise<void> => {
+      if (clusterClient) {
+        try {
+          await clusterClient.close()
+        } catch {
+          // best-effort
+        }
+      }
+    }
+    process.on('SIGINT', () => void shutdown())
+    process.on('SIGTERM', () => void shutdown())
+  }
+
+  // -----------------------------------------------------------------------
   // 6. wireSession() — called when POST /sessions/start spawns a process
   // -----------------------------------------------------------------------
 
@@ -241,6 +283,11 @@ async function main() {
       // Switch to running state FIRST so UI shows chat view
       sessionState = 'running'
       sse.broadcastStatus('running')
+      clusterClient?.updateStatus({
+        status: 'running',
+        sessionId,
+        project: undefined,
+      })
 
       // THEN replay conversation history (arrives after UI is in chat view)
       if (sessionId) {
@@ -294,6 +341,7 @@ async function main() {
       // Broadcast session_ended + new waiting status to all SSE clients
       sse.broadcastStatus('session_ended', { exitCode: code ?? 0 })
       sse.broadcastStatus('waiting_for_session')
+      clusterClient?.updateStatus({ status: 'idle' })
 
       console.log('   Bridge waiting for next session...')
     })

@@ -117,12 +117,12 @@ describe('clusterClient', () => {
     // Flush for first attempt (fails immediately)
     await flushPromises()
 
-    // Advance past backoff for attempt 2 (1s delay)
-    vi.advanceTimersByTime(1100)
+    // Advance past backoff for attempt 2 (1s base + up to 25% jitter → cap at 2s)
+    vi.advanceTimersByTime(2000)
     await flushPromises()
 
-    // Advance past backoff for attempt 3 (2s delay)
-    vi.advanceTimersByTime(2100)
+    // Advance past backoff for attempt 3 (2s base + up to 25% jitter → cap at 3s)
+    vi.advanceTimersByTime(3000)
     await flushPromises()
 
     await startPromise
@@ -150,7 +150,7 @@ describe('clusterClient', () => {
     const startPromise = client.start()
     await flushPromises()
 
-    vi.advanceTimersByTime(1100)
+    vi.advanceTimersByTime(2000)
     await flushPromises()
 
     await startPromise
@@ -191,8 +191,12 @@ describe('clusterClient', () => {
     await flushPromises()
     expect(fetchMock.mock.calls.length).toBe(2) // 1 register + 1 heartbeat
 
-    // Advance 2 more intervals
-    vi.advanceTimersByTime(2000)
+    // Advance another interval (flush between so in-flight guard clears)
+    vi.advanceTimersByTime(1000)
+    await flushPromises()
+    expect(fetchMock.mock.calls.length).toBe(3) // 1 register + 2 heartbeats
+
+    vi.advanceTimersByTime(1000)
     await flushPromises()
     expect(fetchMock.mock.calls.length).toBe(4) // 1 register + 3 heartbeats
 
