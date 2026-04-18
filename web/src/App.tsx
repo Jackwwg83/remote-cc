@@ -190,8 +190,13 @@ export default function App() {
         return
       }
 
-      // T-F10: Handle session_status messages to switch between picker and chat
+      // T-F10: Handle session_status messages to switch between picker and chat.
+      // In cluster mode, the server's local SSE emits these events for the
+      // server's own bridge — they must NOT force the user out of the
+      // dashboard/machineSessions/chat flow that targets another machine.
+      // We only act on session_status when in standalone mode.
       if (d.type === 'system' && d.subtype === 'session_status') {
+        if (isClusterMode) return
         const sessionState = d.state as string
         if (sessionState === 'waiting_for_session') {
           setView('picker')
