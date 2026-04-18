@@ -191,17 +191,37 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
 
       const reader = upstream.body.getReader()
       for (;;) {
+        // Stop if client already disconnected between chunks
+        if (controller.signal.aborted || clientRes.writableEnded || clientRes.destroyed) break
+
         const { done, value } = await reader.read()
         if (done) break
-        if (value) {
-          const ok = clientRes.write(Buffer.from(value))
-          if (!ok) {
-            // Wait for drain to avoid runaway buffering
-            await new Promise<void>((r) => clientRes.once('drain', r))
+        if (!value) continue
+
+        const ok = clientRes.write(Buffer.from(value))
+        if (ok) continue
+
+        // Wait for drain — but race against disconnect so we don't hang
+        // forever if the socket dies without emitting 'drain'.
+        await new Promise<void>((resolve) => {
+          const onDrain = () => { cleanup(); resolve() }
+          const onClose = () => { cleanup(); resolve() }
+          const onError = () => { cleanup(); resolve() }
+          const cleanup = () => {
+            clientRes.off('drain', onDrain)
+            clientRes.off('close', onClose)
+            clientRes.off('error', onError)
+            clientReq.off('close', onClose)
           }
-        }
+          clientRes.once('drain', onDrain)
+          clientRes.once('close', onClose)
+          clientRes.once('error', onError)
+          clientReq.once('close', onClose)
+        })
+
+        if (controller.signal.aborted || clientRes.writableEnded || clientRes.destroyed) break
       }
-      clientRes.end()
+      try { clientRes.end() } catch { /* socket already closed */ }
     } catch (err) {
       if (!clientRes.headersSent) {
         clientRes.writeHead(502, { 'Content-Type': 'application/json' })

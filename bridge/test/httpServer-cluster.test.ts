@@ -198,7 +198,7 @@ describe('httpServer /cluster/* endpoints', () => {
   // GET /cluster/status
   // -----------------------------------------------------------------------
 
-  it('GET /cluster/status returns all machines including self', async () => {
+  it('GET /cluster/status returns all machines including self, with sessionTokens stripped', async () => {
     cluster.register({
       machineId: 'client-1',
       name: 'Client One',
@@ -209,10 +209,18 @@ describe('httpServer /cluster/* endpoints', () => {
       headers: { 'Authorization': `Bearer ${CLUSTER_TOKEN}` },
     })
     expect(res.status).toBe(200)
-    const json = await res.json() as { machines: Array<{ machineId: string }> }
-    const ids = json.machines.map((m) => m.machineId).sort()
+    const json = await res.json() as { machines: Array<Record<string, unknown>> }
+    const ids = json.machines.map((m) => m.machineId as string).sort()
     expect(ids).toContain('client-1')
     expect(ids).toContain('server-id')
+    // SECURITY: sessionToken must NEVER appear in the response
+    for (const m of json.machines) {
+      expect(m.sessionToken).toBeUndefined()
+    }
+    // Raw JSON text should also not contain the token strings
+    const raw = JSON.stringify(json)
+    expect(raw).not.toContain('tok-1')
+    expect(raw).not.toContain('server-tok')
   })
 
   // -----------------------------------------------------------------------

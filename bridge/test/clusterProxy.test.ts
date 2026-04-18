@@ -138,6 +138,145 @@ describe('clusterProxy.forwardAction()', () => {
 // proxyMessage()
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// proxyStream()
+// ---------------------------------------------------------------------------
+
+describe('clusterProxy.proxyStream()', () => {
+  /** Minimal fake IncomingMessage — we only need `headers` and EventEmitter-ish on/off/once. */
+  function makeReq(opts: { lastEventId?: string } = {}): {
+    headers: Record<string, string | undefined>
+    on: (e: string, fn: () => void) => void
+    once: (e: string, fn: () => void) => void
+    off: (e: string, fn: () => void) => void
+    emit: (e: string) => void
+  } {
+    const listeners: Record<string, Array<() => void>> = {}
+    return {
+      headers: opts.lastEventId ? { 'last-event-id': opts.lastEventId } : {},
+      on(e, fn) { (listeners[e] ??= []).push(fn) },
+      once(e, fn) { (listeners[e] ??= []).push(fn) },
+      off(e, fn) { listeners[e] = (listeners[e] ?? []).filter((f) => f !== fn) },
+      emit(e) { for (const f of listeners[e] ?? []) f() },
+    }
+  }
+
+  /** Minimal fake ServerResponse with writable tracking. */
+  function makeRes(opts: { writeReturns?: boolean[] } = {}) {
+    const listeners: Record<string, Array<() => void>> = {}
+    let headersSent = false
+    let writableEnded = false
+    const writeSequence = opts.writeReturns ?? []
+    let writeIndex = 0
+    const written: Buffer[] = []
+    let writtenHead: { status: number; headers: Record<string, string> } | null = null
+
+    const res = {
+      headersSent: false,
+      writableEnded: false,
+      destroyed: false,
+      writeHead(status: number, headers: Record<string, string>) {
+        headersSent = true
+        ;(res as unknown as { headersSent: boolean }).headersSent = true
+        writtenHead = { status, headers }
+      },
+      write(buf: Buffer | Uint8Array): boolean {
+        written.push(Buffer.from(buf))
+        const r = writeIndex < writeSequence.length ? writeSequence[writeIndex++] : true
+        return r as boolean
+      },
+      end() {
+        writableEnded = true
+        ;(res as unknown as { writableEnded: boolean }).writableEnded = true
+      },
+      once(e: string, fn: () => void) { (listeners[e] ??= []).push(fn) },
+      on(e: string, fn: () => void) { (listeners[e] ??= []).push(fn) },
+      off(e: string, fn: () => void) { listeners[e] = (listeners[e] ?? []).filter((f) => f !== fn) },
+      emit(e: string) { for (const f of [...(listeners[e] ?? [])]) f() },
+      get _writtenHead() { return writtenHead },
+      get _written() { return written },
+      get _writableEnded() { return writableEnded },
+      get _headersSent() { return headersSent },
+    }
+    return res
+  }
+
+  function makeSseResponse(chunks: string[]): Response {
+    const encoded = chunks.map((c) => new TextEncoder().encode(c))
+    let i = 0
+    const stream = {
+      getReader() {
+        return {
+          async read() {
+            if (i >= encoded.length) return { done: true, value: undefined }
+            return { done: false, value: encoded[i++] }
+          },
+        }
+      },
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      body: stream,
+    } as unknown as Response
+  }
+
+  it('forwards Last-Event-ID header to target', async () => {
+    const cluster = makeCluster({ 'machine-a': makeMachine() })
+    const fetchMock = vi.fn().mockResolvedValue(makeSseResponse(['data: hi\n\n']))
+    const proxy = createClusterProxy({ cluster, fetchImpl: fetchMock })
+
+    const req = makeReq({ lastEventId: '42' })
+    const res = makeRes()
+    await proxy.proxyStream('machine-a', req as never, res as never)
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://alpha.local:7860/events/stream',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          'Authorization': 'Bearer tok-alpha',
+          'Last-Event-ID': '42',
+        }),
+      }),
+    )
+  })
+
+  it('returns 404 for unknown machine without opening stream', async () => {
+    const cluster = makeCluster({})
+    const fetchMock = vi.fn()
+    const proxy = createClusterProxy({ cluster, fetchImpl: fetchMock })
+
+    const req = makeReq()
+    const res = makeRes()
+    await proxy.proxyStream('missing', req as never, res as never)
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(res._writtenHead?.status).toBe(404)
+  })
+
+  it('does not hang when client disconnects during backpressure', async () => {
+    const cluster = makeCluster({ 'machine-a': makeMachine() })
+    // Chunk 1 → write returns false → wait for drain; we'll emit close instead
+    const fetchMock = vi.fn().mockResolvedValue(makeSseResponse(['data: a\n\n', 'data: b\n\n']))
+    const proxy = createClusterProxy({ cluster, fetchImpl: fetchMock })
+
+    const req = makeReq()
+    const res = makeRes({ writeReturns: [false] })
+    const streamPromise = proxy.proxyStream('machine-a', req as never, res as never)
+
+    // Let the first write happen, then simulate disconnect before 'drain' fires
+    await new Promise((r) => setImmediate(r))
+    res.emit('close')
+
+    // Must resolve (not hang)
+    await Promise.race([
+      streamPromise,
+      new Promise((_r, rej) => setTimeout(() => rej(new Error('hung')), 500)),
+    ])
+  })
+})
+
 describe('clusterProxy.proxyMessage()', () => {
   it('forwards POST body to target /messages with bearer auth', async () => {
     const cluster = makeCluster({ 'machine-a': makeMachine() })

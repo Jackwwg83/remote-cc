@@ -529,8 +529,18 @@ async function handleRequestAsync(
     }
 
     // Route: GET /cluster/status — all machine states
+    // SECURITY: sessionToken is stripped. It's identity proof for heartbeats +
+    // bearer for the target's local endpoints. Cluster-token holders should
+    // NOT get direct-bearer access to every machine — they go through the
+    // /cluster/action|message|stream proxies, which resolve sessionToken
+    // server-side. A dedicated authenticated endpoint can issue a scoped
+    // direct-connect token later if a UI truly needs to bypass the proxy.
     if (method === 'GET' && pathname === '/cluster/status') {
-      sendJson(res, 200, { machines: deps.clusterManager.listMachines() })
+      const redacted = deps.clusterManager.listMachines().map((m) => {
+        const { sessionToken: _drop, ...rest } = m
+        return rest
+      })
+      sendJson(res, 200, { machines: redacted })
       return
     }
 
