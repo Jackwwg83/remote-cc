@@ -201,30 +201,44 @@ describe('clusterProxy.proxyStream()', () => {
     return res
   }
 
-  function makeSseResponse(chunks: string[]): Response {
+  function makeSseResponse(chunks: string[], opts: { infinite?: boolean } = {}): {
+    response: Response
+    cancelled: { value: boolean }
+  } {
     const encoded = chunks.map((c) => new TextEncoder().encode(c))
     let i = 0
-    const stream = {
-      getReader() {
-        return {
-          async read() {
-            if (i >= encoded.length) return { done: true, value: undefined }
-            return { done: false, value: encoded[i++] }
-          },
+    const cancelled = { value: false }
+    let pendingResolve: ((r: { done: boolean; value?: Uint8Array }) => void) | null = null
+
+    const reader = {
+      async read() {
+        if (cancelled.value) return { done: true, value: undefined }
+        if (i < encoded.length) return { done: false, value: encoded[i++] }
+        if (!opts.infinite) return { done: true, value: undefined }
+        // Infinite: park forever until cancel() resolves the pending read
+        return new Promise<{ done: boolean; value?: Uint8Array }>((r) => { pendingResolve = r })
+      },
+      async cancel() {
+        cancelled.value = true
+        if (pendingResolve) {
+          pendingResolve({ done: true, value: undefined })
+          pendingResolve = null
         }
       },
     }
-    return {
+    const stream = { getReader: () => reader }
+    const response = {
       ok: true,
       status: 200,
       headers: new Headers(),
       body: stream,
     } as unknown as Response
+    return { response, cancelled }
   }
 
   it('forwards Last-Event-ID header to target', async () => {
     const cluster = makeCluster({ 'machine-a': makeMachine() })
-    const fetchMock = vi.fn().mockResolvedValue(makeSseResponse(['data: hi\n\n']))
+    const fetchMock = vi.fn().mockResolvedValue(makeSseResponse(['data: hi\n\n']).response)
     const proxy = createClusterProxy({ cluster, fetchImpl: fetchMock })
 
     const req = makeReq({ lastEventId: '42' })
@@ -255,25 +269,47 @@ describe('clusterProxy.proxyStream()', () => {
     expect(res._writtenHead?.status).toBe(404)
   })
 
-  it('does not hang when client disconnects during backpressure', async () => {
+  it('cancels upstream + returns promptly when client disconnects during backpressure', async () => {
     const cluster = makeCluster({ 'machine-a': makeMachine() })
-    // Chunk 1 → write returns false → wait for drain; we'll emit close instead
-    const fetchMock = vi.fn().mockResolvedValue(makeSseResponse(['data: a\n\n', 'data: b\n\n']))
+    // Infinite upstream so cancellation is the ONLY way out
+    const { response, cancelled } = makeSseResponse(['data: a\n\n'], { infinite: true })
+    const fetchMock = vi.fn().mockResolvedValue(response)
     const proxy = createClusterProxy({ cluster, fetchImpl: fetchMock })
 
     const req = makeReq()
     const res = makeRes({ writeReturns: [false] })
     const streamPromise = proxy.proxyStream('machine-a', req as never, res as never)
 
-    // Let the first write happen, then simulate disconnect before 'drain' fires
+    // Let the first write happen, then simulate disconnect before 'drain'
     await new Promise((r) => setImmediate(r))
     res.emit('close')
 
-    // Must resolve (not hang)
     await Promise.race([
       streamPromise,
       new Promise((_r, rej) => setTimeout(() => rej(new Error('hung')), 500)),
     ])
+    // CRITICAL: upstream reader MUST be cancelled, not just the promise resolved
+    expect(cancelled.value).toBe(true)
+  })
+
+  it('cancels upstream when client request closes mid-stream', async () => {
+    const cluster = makeCluster({ 'machine-a': makeMachine() })
+    const { response, cancelled } = makeSseResponse([], { infinite: true })
+    const fetchMock = vi.fn().mockResolvedValue(response)
+    const proxy = createClusterProxy({ cluster, fetchImpl: fetchMock })
+
+    const req = makeReq()
+    const res = makeRes()
+    const streamPromise = proxy.proxyStream('machine-a', req as never, res as never)
+
+    await new Promise((r) => setImmediate(r))
+    req.emit('close')
+
+    await Promise.race([
+      streamPromise,
+      new Promise((_r, rej) => setTimeout(() => rej(new Error('hung')), 500)),
+    ])
+    expect(cancelled.value).toBe(true)
   })
 })
 

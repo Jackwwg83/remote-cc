@@ -161,9 +161,19 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
     if (typeof lastEventId === 'string') headers['Last-Event-ID'] = lastEventId
 
     const controller = new AbortController()
-    // Abort upstream fetch if client disconnects
-    const onClose = () => controller.abort()
-    clientReq.once('close', onClose)
+    // Reader is created after upstream resolves; disconnect handlers need to
+    // cancel it too, so hold a ref we can fill in once it exists.
+    let upstreamReader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    const abortUpstream = (): void => {
+      if (!controller.signal.aborted) {
+        try { controller.abort() } catch { /* already aborted */ }
+      }
+      if (upstreamReader) {
+        try { void upstreamReader.cancel() } catch { /* already cancelled */ }
+      }
+    }
+    const onClientClose = () => abortUpstream()
+    clientReq.once('close', onClientClose)
 
     try {
       const upstream = await fetchImpl(joinUrl(machine.url, '/events/stream'), {
@@ -190,36 +200,49 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
       })
 
       const reader = upstream.body.getReader()
-      for (;;) {
-        // Stop if client already disconnected between chunks
-        if (controller.signal.aborted || clientRes.writableEnded || clientRes.destroyed) break
+      upstreamReader = reader
 
-        const { done, value } = await reader.read()
-        if (done) break
-        if (!value) continue
+      // Also cancel upstream if the RESPONSE socket drops (distinct from
+      // the request 'close' already wired above — response can close
+      // independently, e.g. if the HTTP server aborts the write side).
+      const onResGone = () => abortUpstream()
+      clientRes.once('close', onResGone)
+      clientRes.once('error', onResGone)
 
-        const ok = clientRes.write(Buffer.from(value))
-        if (ok) continue
+      try {
+        for (;;) {
+          if (controller.signal.aborted || clientRes.writableEnded || clientRes.destroyed) break
 
-        // Wait for drain — but race against disconnect so we don't hang
-        // forever if the socket dies without emitting 'drain'.
-        await new Promise<void>((resolve) => {
-          const onDrain = () => { cleanup(); resolve() }
-          const onClose = () => { cleanup(); resolve() }
-          const onError = () => { cleanup(); resolve() }
-          const cleanup = () => {
-            clientRes.off('drain', onDrain)
-            clientRes.off('close', onClose)
-            clientRes.off('error', onError)
-            clientReq.off('close', onClose)
-          }
-          clientRes.once('drain', onDrain)
-          clientRes.once('close', onClose)
-          clientRes.once('error', onError)
-          clientReq.once('close', onClose)
-        })
+          const { done, value } = await reader.read()
+          if (done) break
+          if (!value) continue
 
-        if (controller.signal.aborted || clientRes.writableEnded || clientRes.destroyed) break
+          const ok = clientRes.write(Buffer.from(value))
+          if (ok) continue
+
+          // Wait for drain — race against disconnect/error so we don't hang
+          // forever if the socket dies without emitting 'drain'.
+          await new Promise<void>((resolve) => {
+            const onDrain = () => { cleanup(); resolve() }
+            const onClose = () => { abortUpstream(); cleanup(); resolve() }
+            const onError = () => { abortUpstream(); cleanup(); resolve() }
+            const cleanup = () => {
+              clientRes.off('drain', onDrain)
+              clientRes.off('close', onClose)
+              clientRes.off('error', onError)
+              clientReq.off('close', onClose)
+            }
+            clientRes.once('drain', onDrain)
+            clientRes.once('close', onClose)
+            clientRes.once('error', onError)
+            clientReq.once('close', onClose)
+          })
+
+          if (controller.signal.aborted || clientRes.writableEnded || clientRes.destroyed) break
+        }
+      } finally {
+        clientRes.off('close', onResGone)
+        clientRes.off('error', onResGone)
       }
       try { clientRes.end() } catch { /* socket already closed */ }
     } catch (err) {
@@ -233,7 +256,7 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
         try { clientRes.end() } catch { /* socket already gone */ }
       }
     } finally {
-      clientReq.off('close', onClose)
+      clientReq.off('close', onClientClose)
     }
   }
 
