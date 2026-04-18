@@ -17,6 +17,7 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { hostname, platform, arch, cpus, totalmem } from 'node:os'
 import type { ProcessManager, ProcessState } from './processManager.js'
 import type { SessionInfo } from './sessionScanner.js'
 import type { ClaudeProcess, SpawnClaudeOptions } from './spawner.js'
@@ -27,6 +28,7 @@ import { verifyToken } from './auth.js'
 // ---------------------------------------------------------------------------
 
 const VERSION = '0.1.0'
+const BRIDGE_VERSION = '0.2.0'
 
 // Resolve the web dist directory relative to this file's location.
 // In dev (tsx): src/httpServer.ts → ../../web/dist
@@ -61,6 +63,8 @@ export interface HttpServerDeps {
   onMessageReceived?: (msg: Record<string, unknown>) => boolean
   /** Recent message IDs for POST idempotency dedup */
   recentMessageIds?: Set<string>
+  /** This machine's ID (UUID) — exposed at GET /machine/info */
+  machineId?: string
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -245,6 +249,25 @@ async function handleRequestAsync(
   // Route: GET /health
   if (method === 'GET' && pathname === '/health') {
     sendJson(res, 200, { ok: true, version: VERSION })
+    return
+  }
+
+  // Route: GET /machine/info — machine identity + system info
+  if (method === 'GET' && pathname === '/machine/info') {
+    if (!verifyToken(req, deps.authToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
+    sendJson(res, 200, {
+      machineId: deps.machineId ?? '',
+      hostname: hostname(),
+      os: platform(),
+      arch: arch(),
+      cpuCount: cpus().length,
+      memGB: Math.round(totalmem() / 1024 ** 3),
+      nodeVersion: process.version,
+      bridgeVersion: BRIDGE_VERSION,
+    })
     return
   }
 

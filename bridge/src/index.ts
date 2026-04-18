@@ -175,6 +175,7 @@ async function main() {
       return currentMessageHandler(msg)
     },
     recentMessageIds,
+    machineId: cluster.machineId,
   })
 
   // -----------------------------------------------------------------------
