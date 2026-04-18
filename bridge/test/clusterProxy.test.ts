@@ -292,7 +292,7 @@ describe('clusterProxy.proxyStream()', () => {
     expect(cancelled.value).toBe(true)
   })
 
-  it('cancels upstream when client request closes mid-stream', async () => {
+  it('cancels upstream when client response closes mid-stream', async () => {
     const cluster = makeCluster({ 'machine-a': makeMachine() })
     const { response, cancelled } = makeSseResponse([], { infinite: true })
     const fetchMock = vi.fn().mockResolvedValue(response)
@@ -303,7 +303,10 @@ describe('clusterProxy.proxyStream()', () => {
     const streamPromise = proxy.proxyStream('machine-a', req as never, res as never)
 
     await new Promise((r) => setImmediate(r))
-    req.emit('close')
+    // ServerResponse 'close' is the canonical peer-disconnect signal —
+    // IncomingMessage 'close' is NOT reliable (fires on request completion
+    // on Node >=18, not just disconnect).
+    res.emit('close')
 
     await Promise.race([
       streamPromise,
