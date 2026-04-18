@@ -177,8 +177,11 @@ describe('App cluster mode view routing', () => {
     const App = AppMod.default
     render(<App />)
 
-    // Standalone mode starts on picker, so it's already there. Transition to chat first.
+    // Standalone starts on picker. First confirm that.
     await waitFor(() => expect(transportInstance).not.toBeNull())
+    expect(screen.getByText('Select a session')).toBeTruthy()
+
+    // Transition to chat
     await act(async () => {
       transportInstance!.fireMessage({
         type: 'system',
@@ -187,6 +190,13 @@ describe('App cluster mode view routing', () => {
       })
       await Promise.resolve()
     })
+    // CRITICAL: confirm the transition actually moved us into chat view —
+    // without this the next assertion could trivially pass on the
+    // pre-existing picker DOM even if React state updates weren't
+    // flushing at all.
+    await waitFor(() => expect(screen.queryByText('Select a session')).toBeNull())
+    expect(screen.getByPlaceholderText(/Type a message|Waiting for connection/i)).toBeTruthy()
+
     // Now in chat; firing waiting_for_session should bounce back to picker
     await act(async () => {
       transportInstance!.fireMessage({
@@ -196,7 +206,6 @@ describe('App cluster mode view routing', () => {
       })
       await Promise.resolve()
     })
-    // Picker heading appears
     await waitFor(() => expect(screen.getByText('Select a session')).toBeTruthy())
     expect(screen.queryByText('Machines')).toBeNull()
   })
