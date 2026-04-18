@@ -101,9 +101,13 @@ export async function printStartupBanner(
   port: number,
   token?: string,
   tailscale?: TailscaleStatus,
+  clusterToken?: string,
 ): Promise<void> {
   const addrs = detectNetworkAddresses()
-  const qs = token ? `?token=${token}` : ''
+  const params = new URLSearchParams()
+  if (token) params.set('token', token)
+  if (clusterToken) params.set('cluster_token', clusterToken)
+  const qs = params.toString() ? `?${params.toString()}` : ''
 
   // Prefer Tailscale CLI IP over network-interface detection
   const tailscaleIp = tailscale?.ip ?? addrs.tailscale

@@ -213,7 +213,7 @@ async function main() {
   // 5. Detect Tailscale + print terminal UI banner (with token in URLs)
   // -----------------------------------------------------------------------
   const tailscale = await detectTailscale()
-  await printStartupBanner(url, port, token, tailscale)
+  await printStartupBanner(url, port, token, tailscale, cluster.role === 'server' ? cluster.clusterToken : undefined)
 
   // -----------------------------------------------------------------------
   // 5b. If running as cluster client, register + start heartbeats

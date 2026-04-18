@@ -8,6 +8,9 @@ import PermissionDialog, { type PermissionRequest, type PermissionAction } from 
 import InstallPrompt from './InstallPrompt'
 import QuickCommands from './QuickCommands'
 import SessionPicker from './SessionPicker'
+import MachineDashboard, { type ClusterMachine } from './MachineDashboard'
+import GlobalSessionList, { type GlobalSessionInfo } from './GlobalSessionList'
+import { getClusterToken, getClusterHeaders } from './authUtils'
 
 /** System subtypes that are internal/technical — never shown in chat */
 const SKIP_SUBTYPES = new Set([
@@ -52,8 +55,14 @@ export default function App() {
   const [input, setInput] = useState('')
   // T-19: Pending permission requests (Map<request_id, PermissionRequest>)
   const [pendingPerms, setPendingPerms] = useState<Map<string, PermissionRequest>>(new Map())
-  // T-F10: View state — show session picker or chat interface
-  const [view, setView] = useState<'picker' | 'chat'>('picker')
+  // Cluster mode: dashboard → machineSessions (picker for single machine) → chat
+  // Standalone: picker → chat (existing behavior)
+  const isClusterMode = Boolean(getClusterToken())
+  const [view, setView] = useState<'dashboard' | 'picker' | 'machineSessions' | 'chat'>(
+    isClusterMode ? 'dashboard' : 'picker',
+  )
+  // When in cluster mode, tracks the currently-targeted machine (null = server itself)
+  const [targetMachine, setTargetMachine] = useState<ClusterMachine | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<ReturnType<typeof connectTransport> | null>(null)
   const streamStateRef = useRef(createStreamingState())
@@ -327,6 +336,31 @@ export default function App() {
     }
   }, [])
 
+  // Cluster mode: start/resume a session on a target machine via /cluster/action.
+  // The bridge's heartbeat will flip status to "running" → UI transitions to chat.
+  const startClusterSession = useCallback(async (machineId: string, sessionId?: string) => {
+    try {
+      const body: Record<string, string> = { machineId, action: 'start_session' }
+      if (sessionId) body.sessionId = sessionId
+      const res = await fetch('/cluster/action', {
+        method: 'POST',
+        headers: getClusterHeaders(),
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        console.error('Cluster start_session failed:', data.error)
+        return
+      }
+      // For now, jump directly to chat view. Real transport wiring to the
+      // target machine's SSE (via proxy) is handled by a follow-up task —
+      // this gives the user feedback that the request was accepted.
+      setView('chat')
+    } catch (err) {
+      console.error('Cluster start_session error:', err)
+    }
+  }, [])
+
   // T-F10: Start a new or existing session via REST API
   const startSession = useCallback(async (sessionId?: string, cwd?: string) => {
     try {
@@ -417,8 +451,31 @@ export default function App() {
         </div>
       )}
 
-      {/* T-F10: Conditional rendering — session picker or chat interface */}
-      {view === 'picker' ? (
+      {/* View routing — cluster mode: dashboard → machineSessions → chat;
+          standalone: picker → chat */}
+      {view === 'dashboard' ? (
+        <MachineDashboard
+          onOpenMachine={(m) => {
+            setTargetMachine(m)
+            setView('machineSessions')
+          }}
+          onStartMachine={(m) => {
+            // Start a new session on this machine via cluster proxy
+            setTargetMachine(m)
+            startClusterSession(m.machineId).catch(console.error)
+          }}
+        />
+      ) : view === 'machineSessions' ? (
+        <GlobalSessionList
+          machineFilter={targetMachine?.machineId}
+          onSelect={(s) => {
+            startClusterSession(s.machineId, s.id).catch(console.error)
+          }}
+          onNew={(machineId) => {
+            startClusterSession(machineId).catch(console.error)
+          }}
+        />
+      ) : view === 'picker' ? (
         <SessionPicker
           onSelect={(id, cwd) => startSession(id, cwd)}
           onNew={() => startSession()}
