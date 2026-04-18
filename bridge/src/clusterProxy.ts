@@ -152,13 +152,25 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
       return
     }
 
-    // Forward Last-Event-ID if present so target can replay missed messages
+    // Forward Last-Event-ID if present so target can replay missed messages.
+    // Also forward from_seq query param — the browser EventSource doesn't set
+    // Last-Event-ID until it has received an event, so on the first switch
+    // from direct→proxy the caller uses ?from_seq=N to resume. Pass it through
+    // so the target's SSE endpoint can serve the replay.
     const lastEventId = clientReq.headers['last-event-id']
     const headers: Record<string, string> = {
       'Accept': 'text/event-stream',
       'Authorization': `Bearer ${machine.sessionToken}`,
     }
     if (typeof lastEventId === 'string') headers['Last-Event-ID'] = lastEventId
+
+    // Extract from_seq from client's request URL to forward to target
+    let fromSeqQuery = ''
+    try {
+      const incoming = new URL(clientReq.url ?? '', 'http://localhost')
+      const fromSeq = incoming.searchParams.get('from_seq')
+      if (fromSeq) fromSeqQuery = `?from_seq=${encodeURIComponent(fromSeq)}`
+    } catch { /* malformed URL — proceed without */ }
 
     const controller = new AbortController()
     // Reader is created after upstream resolves; disconnect handlers need to
@@ -186,7 +198,7 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
     if (clientSocket) clientSocket.once('close', onClientGone)
 
     try {
-      const upstream = await fetchImpl(joinUrl(machine.url, '/events/stream'), {
+      const upstream = await fetchImpl(joinUrl(machine.url, '/events/stream') + fromSeqQuery, {
         method: 'GET',
         headers,
         signal: controller.signal,

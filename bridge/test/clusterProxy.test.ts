@@ -143,9 +143,10 @@ describe('clusterProxy.forwardAction()', () => {
 // ---------------------------------------------------------------------------
 
 describe('clusterProxy.proxyStream()', () => {
-  /** Minimal fake IncomingMessage — we only need `headers` and EventEmitter-ish on/off/once. */
-  function makeReq(opts: { lastEventId?: string } = {}): {
+  /** Minimal fake IncomingMessage — we only need `headers`, `url`, and EventEmitter-ish on/off/once. */
+  function makeReq(opts: { lastEventId?: string; url?: string } = {}): {
     headers: Record<string, string | undefined>
+    url?: string
     on: (e: string, fn: () => void) => void
     once: (e: string, fn: () => void) => void
     off: (e: string, fn: () => void) => void
@@ -154,6 +155,7 @@ describe('clusterProxy.proxyStream()', () => {
     const listeners: Record<string, Array<() => void>> = {}
     return {
       headers: opts.lastEventId ? { 'last-event-id': opts.lastEventId } : {},
+      url: opts.url ?? '/cluster/stream?machineId=machine-a',
       on(e, fn) { (listeners[e] ??= []).push(fn) },
       once(e, fn) { (listeners[e] ??= []).push(fn) },
       off(e, fn) { listeners[e] = (listeners[e] ?? []).filter((f) => f !== fn) },
@@ -235,6 +237,21 @@ describe('clusterProxy.proxyStream()', () => {
     } as unknown as Response
     return { response, cancelled }
   }
+
+  it('forwards from_seq query param to target for first-switch replay', async () => {
+    const cluster = makeCluster({ 'machine-a': makeMachine() })
+    const fetchMock = vi.fn().mockResolvedValue(makeSseResponse(['data: hi\n\n']).response)
+    const proxy = createClusterProxy({ cluster, fetchImpl: fetchMock })
+
+    const req = makeReq({ url: '/cluster/stream?machineId=machine-a&from_seq=42&token=x' })
+    const res = makeRes()
+    await proxy.proxyStream('machine-a', req as never, res as never)
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://alpha.local:7860/events/stream?from_seq=42',
+      expect.anything(),
+    )
+  })
 
   it('forwards Last-Event-ID header to target', async () => {
     const cluster = makeCluster({ 'machine-a': makeMachine() })
