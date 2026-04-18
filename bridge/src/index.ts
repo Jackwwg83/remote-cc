@@ -21,7 +21,6 @@
  */
 
 import { parseArgs } from 'node:util'
-import { hostname } from 'node:os'
 import { startHttpServer } from './httpServer.js'
 import { createSseWriter } from './sseWriter.js'
 import { createLineReader, writeLine } from './lineReader.js'
@@ -35,7 +34,8 @@ import { createProcessManager } from './processManager.js'
 import { scanSessions } from './sessionScanner.js'
 import type { ClaudeProcess } from './spawner.js'
 import { readSessionHistory } from './sessionHistory.js'
-import { getOrCreateMachineId } from './machineId.js'
+import { loadClusterConfig, maskToken } from './clusterConfig.js'
+import type { ClusterConfig } from './clusterConfig.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -85,55 +85,40 @@ Cluster Options:
   process.exit(0)
 }
 
-// Module-scoped cluster config — available to later modules (T-M02, T-M03, T-M04, etc.)
-export let clusterRole: 'server' | 'client' | 'standalone' = 'standalone'
-export let clusterMachineId: string = ''
-export let clusterMachineName: string = ''
-export let clusterToken: string | undefined
-export let clusterServerUrl: string | undefined
-export let clusterServerToken: string | undefined
-
 async function main() {
   const port = parseInt(args.port ?? '7860', 10)
 
   // -----------------------------------------------------------------------
-  // 0-pre. Resolve role + cluster config
+  // 0-pre. Resolve role + cluster config (validated, immutable)
   // -----------------------------------------------------------------------
-  const roleRaw = args.role ?? process.env.REMOTE_CC_ROLE ?? 'standalone'
-  if (!['server', 'client', 'standalone'].includes(roleRaw)) {
-    console.error(`Invalid role: ${roleRaw}. Must be server, client, or standalone.`)
+  let cluster: ClusterConfig
+  try {
+    cluster = await loadClusterConfig({
+      role: args.role,
+      server: args.server,
+      'server-token': args['server-token'],
+      'machine-name': args['machine-name'],
+      'cluster-token': args['cluster-token'],
+    })
+  } catch (err) {
+    console.error((err as Error).message)
     process.exit(1)
   }
-  clusterRole = roleRaw as 'server' | 'client' | 'standalone'
 
-  clusterMachineId = await getOrCreateMachineId()
-  clusterMachineName = args['machine-name'] ?? process.env.REMOTE_CC_MACHINE_NAME ?? hostname()
-
-  if (clusterRole === 'client') {
-    const serverUrl = args.server ?? process.env.REMOTE_CC_SERVER
-    const serverToken = args['server-token'] ?? process.env.REMOTE_CC_SERVER_TOKEN
-    if (!serverUrl || !serverToken) {
-      console.error('--role client requires --server <url> and --server-token <token>')
-      console.error('(or REMOTE_CC_SERVER + REMOTE_CC_SERVER_TOKEN env vars)')
-      process.exit(1)
-    }
-    clusterServerUrl = serverUrl
-    clusterServerToken = serverToken
-    console.log(`   Cluster role: client (connecting to ${serverUrl})`)
-    console.log(`   Machine: ${clusterMachineName} (${clusterMachineId.slice(0, 8)}...)`)
-  }
-
-  if (clusterRole === 'server') {
-    const providedToken = args['cluster-token'] ?? process.env.REMOTE_CC_CLUSTER_TOKEN
-    if (!providedToken) {
-      const { randomBytes } = await import('node:crypto')
-      clusterToken = 'rcc_cluster_' + randomBytes(32).toString('base64url')
-    } else {
-      clusterToken = providedToken
-    }
+  if (cluster.role === 'client') {
+    console.log(`   Cluster role: client (connecting to ${cluster.serverUrl})`)
+    console.log(`   Machine: ${cluster.machineName} (${cluster.machineId.slice(0, 8)}…)`)
+  } else if (cluster.role === 'server') {
     console.log(`   Cluster role: server`)
-    console.log(`   Machine: ${clusterMachineName} (${clusterMachineId.slice(0, 8)}...)`)
-    console.log(`   Cluster token: ${clusterToken}`)
+    console.log(`   Machine: ${cluster.machineName} (${cluster.machineId.slice(0, 8)}…)`)
+    // Print cluster token once on stderr so ops can capture if needed, but
+    // masked by default on stdout. Full token is only visible via `--show-token`
+    // or if this is an interactive terminal.
+    if (process.stdout.isTTY) {
+      console.log(`   Cluster token: ${cluster.clusterToken}`)
+    } else {
+      console.log(`   Cluster token: ${maskToken(cluster.clusterToken!)}  (full value not logged in non-TTY)`)
+    }
   }
 
   // -----------------------------------------------------------------------
