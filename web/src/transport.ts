@@ -44,11 +44,26 @@ function backoffWithJitter(attempt: number): number {
 // connectTransport
 // ---------------------------------------------------------------------------
 
-export function connectTransport(baseHttpUrl: string) {
+export interface TransportOptions {
+  /** Override SSE path. Default: '/events/stream'. Used for /cluster/stream. */
+  ssePath?: string
+  /** Override POST path. Default: '/messages'. Used for /cluster/message. */
+  postPath?: string
+  /** Extra query params to append to SSE URL (e.g. machineId for proxy). */
+  extraQuery?: Record<string, string>
+  /** Initial seq so the first connection can resume from a cached position
+   *  (used by the multi-machine wrapper during direct→proxy switch). */
+  initialSeq?: number
+}
+
+export function connectTransport(baseHttpUrl: string, options: TransportOptions = {}) {
   // --- Parse origin + token from the provided URL ---
   const url = new URL(baseHttpUrl)
   const origin = url.origin
   const token = url.searchParams.get('token') ?? ''
+  const ssePath = options.ssePath ?? '/events/stream'
+  const postPath = options.postPath ?? '/messages'
+  const extraQuery = options.extraQuery ?? {}
 
   // --- State ---
   type MessageCallback = (data: unknown) => void
@@ -58,7 +73,7 @@ export function connectTransport(baseHttpUrl: string) {
   const stateCallbacks: StateCallback[] = []
   let currentState: TransportState = 'connecting'
   let es: EventSource | null = null
-  let lastSeq = 0
+  let lastSeq = options.initialSeq ?? 0
   let closed = false
 
   // Reconnect tracking
@@ -116,9 +131,10 @@ export function connectTransport(baseHttpUrl: string) {
   // -------------------------------------------------------------------------
 
   function buildSseUrl(): string {
-    const sseUrl = new URL('/events/stream', origin)
+    const sseUrl = new URL(ssePath, origin)
     if (token) sseUrl.searchParams.set('token', token)
     if (lastSeq > 0) sseUrl.searchParams.set('from_seq', String(lastSeq))
+    for (const [k, v] of Object.entries(extraQuery)) sseUrl.searchParams.set(k, v)
     return sseUrl.toString()
   }
 
@@ -283,7 +299,10 @@ export function connectTransport(baseHttpUrl: string) {
         ? { ...msg, _messageId: messageId }
         : { payload: msg, _messageId: messageId }
 
-      const postUrl = `${origin}/messages`
+      const postPathWithQuery = Object.entries(extraQuery).length > 0
+        ? `${postPath}?${new URLSearchParams(extraQuery).toString()}`
+        : postPath
+      const postUrl = `${origin}${postPathWithQuery}`
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
       }

@@ -17,16 +17,22 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { join, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { hostname, platform, arch, cpus, totalmem } from 'node:os'
 import type { ProcessManager, ProcessState } from './processManager.js'
 import type { SessionInfo } from './sessionScanner.js'
 import type { ClaudeProcess, SpawnClaudeOptions } from './spawner.js'
 import { verifyToken } from './auth.js'
+import type { ClusterManager, MachineState } from './clusterManager.js'
+import type { ClusterProxy, ClusterActionRequest } from './clusterProxy.js'
+import type { Migrator } from './migrator.js'
+import { timingSafeEqual } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const VERSION = '0.1.0'
+const BRIDGE_VERSION = '0.2.0'
 
 // Resolve the web dist directory relative to this file's location.
 // In dev (tsx): src/httpServer.ts → ../../web/dist
@@ -49,8 +55,9 @@ export interface HttpServerDeps {
   /** Process lifecycle manager — start/stop/status */
   processManager?: ProcessManager
   /** Called after a process is started via POST /sessions/start.
-   *  index.ts hooks this to wire up lineReader, WS bridge, etc. */
-  onSessionStarted?: (proc: ClaudeProcess) => void
+   *  index.ts hooks this to wire up lineReader, SSE bridge, etc.
+   *  sessionId is provided when resuming an existing session. */
+  onSessionStarted?: (proc: ClaudeProcess, sessionId?: string) => void
   /** Auth token for session control endpoints. If set, these endpoints require
    *  `Authorization: Bearer <token>` header or `?token=` query parameter. */
   authToken?: string
@@ -60,6 +67,19 @@ export interface HttpServerDeps {
   onMessageReceived?: (msg: Record<string, unknown>) => boolean
   /** Recent message IDs for POST idempotency dedup */
   recentMessageIds?: Set<string>
+  /** This machine's ID (UUID) — exposed at GET /machine/info */
+  machineId?: string
+  /** Cluster manager (server role only) — enables /cluster/* endpoints. */
+  clusterManager?: ClusterManager
+  /** Cluster proxy (server role only) — enables action/stream/message forwarding. */
+  clusterProxy?: ClusterProxy
+  /** Migrator (server role only) — powers POST /cluster/migrate. */
+  migrator?: Migrator
+  /** Cluster token (server role only) — auth for /cluster/* endpoints.
+   *  Clients and UIs must present this via Authorization header or ?token=. */
+  clusterToken?: string
+  /** fetch impl used for aggregate /cluster/sessions?refresh=true. Injectable for tests. */
+  fetchImpl?: typeof fetch
 }
 
 const CORS_HEADERS: Record<string, string> = {
@@ -154,6 +174,59 @@ async function tryServeStatic(urlPath: string, res: ServerResponse): Promise<boo
 
 // Auth check delegates to shared verifyToken from auth.ts
 
+/**
+ * TTL cache for /cluster/sessions?refresh=true.
+ *
+ * Defense against the amplification DoS an adversarial reviewer flagged:
+ * every refresh fans out in parallel to every online client's
+ * /sessions/history, which scans ~/.claude/projects on every target. One
+ * cluster-token holder could loop this endpoint and burn disk/CPU across
+ * the whole cluster.
+ *
+ * Mitigation: share the fan-out result for the window below. Also keeps
+ * a single-in-flight gate so N concurrent refresh callers only trigger
+ * one fan-out. Default window matches the heartbeat period (~30s would
+ * just reuse cached sessions anyway) but we err shorter for staleness.
+ */
+const REFRESH_CACHE_TTL_MS = 5_000
+
+interface RefreshCache<T> {
+  expiresAt: number
+  inFlight: Promise<T> | null
+  value: T | null
+}
+
+function createRefreshCache<T>(): RefreshCache<T> {
+  return { expiresAt: 0, inFlight: null, value: null }
+}
+
+/** Enriched session (session + machine origin) — used in /cluster/sessions. */
+type EnrichedSession = SessionInfo & {
+  machineId: string
+  machineName: string
+  machineStatus: MachineState['status']
+}
+
+/** Timing-safe cluster token check. Accepts Authorization: Bearer or ?token=. */
+function verifyClusterToken(req: IncomingMessage, token: string | undefined): boolean {
+  if (!token) return false
+  const expected = Buffer.from(token, 'utf8')
+  const auth = req.headers['authorization']
+  if (typeof auth === 'string' && auth.startsWith('Bearer ')) {
+    const presented = Buffer.from(auth.slice(7), 'utf8')
+    if (presented.length === expected.length && timingSafeEqual(presented, expected)) return true
+  }
+  try {
+    const url = new URL(req.url ?? '', `http://${req.headers.host ?? 'localhost'}`)
+    const q = url.searchParams.get('token')
+    if (q) {
+      const presented = Buffer.from(q, 'utf8')
+      if (presented.length === expected.length && timingSafeEqual(presented, expected)) return true
+    }
+  } catch { /* ignore */ }
+  return false
+}
+
 /** Max body size for POST requests (64 KiB — more than enough for JSON control messages). */
 const MAX_BODY_BYTES = 64 * 1024
 
@@ -206,9 +279,13 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 // ---------------------------------------------------------------------------
 
 function createRequestHandler(deps: HttpServerDeps) {
+  // Shared per-server refresh cache (only one server instance per process,
+  // so closure state is fine).
+  const refreshCache = createRefreshCache<EnrichedSession[]>()
+
   return function handleRequest(req: IncomingMessage, res: ServerResponse): void {
     // Delegate to async handler, catch unhandled promise rejections
-    handleRequestAsync(req, res, deps).catch((err) => {
+    handleRequestAsync(req, res, deps, refreshCache).catch((err) => {
       console.error('[httpServer] Unhandled error in request handler:', err)
       if (!res.headersSent) {
         sendJson(res, 500, { error: 'Internal Server Error' })
@@ -221,6 +298,7 @@ async function handleRequestAsync(
   req: IncomingMessage,
   res: ServerResponse,
   deps: HttpServerDeps,
+  refreshCache: RefreshCache<Array<SessionInfo & { machineId: string; machineName: string; machineStatus: MachineState['status'] }>>,
 ): Promise<void> {
   const { method } = req
   const rawUrl = req.url ?? '/'
@@ -244,6 +322,25 @@ async function handleRequestAsync(
   // Route: GET /health
   if (method === 'GET' && pathname === '/health') {
     sendJson(res, 200, { ok: true, version: VERSION })
+    return
+  }
+
+  // Route: GET /machine/info — machine identity + system info
+  if (method === 'GET' && pathname === '/machine/info') {
+    if (!verifyToken(req, deps.authToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
+    sendJson(res, 200, {
+      machineId: deps.machineId ?? '',
+      hostname: hostname(),
+      os: platform(),
+      arch: arch(),
+      cpuCount: cpus().length,
+      memGB: Math.round(totalmem() / 1024 ** 3),
+      nodeVersion: process.version,
+      bridgeVersion: BRIDGE_VERSION,
+    })
     return
   }
 
@@ -397,7 +494,7 @@ async function handleRequestAsync(
       const proc = await pm.start(targetCwd, spawnOpts)
       // Notify index.ts (or whoever registered the callback) so it can
       // wire up lineReader, WS bridge, etc.
-      deps.onSessionStarted?.(proc)
+      deps.onSessionStarted?.(proc, sessionId as string | undefined)
       sendJson(res, 200, {
         ok: true,
         sessionId: pm.sessionId ?? null,
@@ -407,6 +504,267 @@ async function handleRequestAsync(
       const message = err instanceof Error ? err.message : 'Spawn failed'
       sendJson(res, 409, { error: message })
     }
+    return
+  }
+
+  // -------------------------------------------------------------------------
+  // Cluster routes (server role only — require clusterManager + clusterToken)
+  // -------------------------------------------------------------------------
+
+  if (pathname.startsWith('/cluster/')) {
+    // All /cluster/* routes require cluster role + cluster token
+    if (!deps.clusterManager || !deps.clusterToken) {
+      sendJson(res, 404, { error: 'Cluster mode not enabled' })
+      return
+    }
+    if (!verifyClusterToken(req, deps.clusterToken)) {
+      sendJson(res, 401, { error: 'Unauthorized' })
+      return
+    }
+
+    // Route: POST /cluster/register — client initial registration
+    if (method === 'POST' && pathname === '/cluster/register') {
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const result = deps.clusterManager.register({
+        machineId: String(body.machineId ?? ''),
+        name: String(body.name ?? ''),
+        url: String(body.url ?? ''),
+        sessionToken: String(body.sessionToken ?? ''),
+        os: typeof body.os === 'string' ? body.os : undefined,
+        hostname: typeof body.hostname === 'string' ? body.hostname : undefined,
+      })
+      sendJson(res, result.ok ? 200 : 400, result)
+      return
+    }
+
+    // Route: POST /cluster/heartbeat — client periodic heartbeat
+    if (method === 'POST' && pathname === '/cluster/heartbeat') {
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const result = deps.clusterManager.heartbeat({
+        machineId: String(body.machineId ?? ''),
+        sessionToken: String(body.sessionToken ?? ''),
+        status: (body.status ?? 'idle') as MachineState['status'],
+        sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+        project: typeof body.project === 'string' ? body.project : undefined,
+        sessions: Array.isArray(body.sessions) ? (body.sessions as SessionInfo[]) : undefined,
+      })
+      // 404 "not registered" triggers client re-register; 401 "sessionToken" → impersonation
+      const status = result.ok ? 200
+        : result.error === 'not registered' ? 404
+        : result.error?.includes('sessionToken') ? 401
+        : 400
+      sendJson(res, status, result)
+      return
+    }
+
+    // Route: GET /cluster/status — all machine states
+    // SECURITY: sessionToken is stripped. It's identity proof for heartbeats +
+    // bearer for the target's local endpoints. Cluster-token holders should
+    // NOT get direct-bearer access to every machine — they go through the
+    // /cluster/action|message|stream proxies, which resolve sessionToken
+    // server-side. A dedicated authenticated endpoint can issue a scoped
+    // direct-connect token later if a UI truly needs to bypass the proxy.
+    if (method === 'GET' && pathname === '/cluster/status') {
+      const redacted = deps.clusterManager.listMachines().map((m) => {
+        const { sessionToken: _drop, ...rest } = m
+        return rest
+      })
+      sendJson(res, 200, { machines: redacted })
+      return
+    }
+
+    // Route: GET /cluster/sessions[?refresh=true] — aggregate session list
+    if (method === 'GET' && pathname === '/cluster/sessions') {
+      const refresh = urlObj.searchParams.get('refresh') === 'true'
+      const machines = deps.clusterManager.listMachines()
+      const fetchImpl = deps.fetchImpl ?? fetch
+      const flatten: EnrichedSession[] = []
+
+      if (refresh) {
+        // Fan out to online machines' /sessions/history.
+        // Cached + single-in-flight: cluster-token holders can't spam this
+        // to amplify disk/CPU across the whole cluster.
+        const now = Date.now()
+        let fanoutPromise: Promise<EnrichedSession[]>
+        if (refreshCache.value !== null && now < refreshCache.expiresAt) {
+          fanoutPromise = Promise.resolve(refreshCache.value)
+        } else if (refreshCache.inFlight !== null) {
+          fanoutPromise = refreshCache.inFlight
+        } else {
+          const online = machines.filter((m) => m.status !== 'offline' && m.url && m.sessionToken)
+          // Cap parallel fan-out so even a pathologically-large cluster can't
+          // saturate the event loop. 8 is generous for our target scale (~10
+          // machines) and still linear in the worst case.
+          const MAX_PARALLEL = 8
+          fanoutPromise = (async () => {
+            const out: EnrichedSession[] = []
+            for (let i = 0; i < online.length; i += MAX_PARALLEL) {
+              const batch = online.slice(i, i + MAX_PARALLEL)
+              const results = await Promise.all(batch.map(async (m) => {
+                try {
+                  const controller = new AbortController()
+                  const timer = setTimeout(() => controller.abort(), 5000)
+                  const resp = await fetchImpl(`${m.url.replace(/\/$/, '')}/sessions/history`, {
+                    headers: { 'Authorization': `Bearer ${m.sessionToken}` },
+                    signal: controller.signal,
+                  })
+                  clearTimeout(timer)
+                  if (!resp.ok) return { m, sessions: [] as SessionInfo[] }
+                  const j = await resp.json() as { sessions?: SessionInfo[] }
+                  return { m, sessions: j.sessions ?? [] }
+                } catch {
+                  return { m, sessions: [] as SessionInfo[] }
+                }
+              }))
+              for (const { m, sessions } of results) {
+                for (const s of sessions) {
+                  out.push({ ...s, machineId: m.machineId, machineName: m.name, machineStatus: m.status })
+                }
+              }
+            }
+            return out
+          })()
+          refreshCache.inFlight = fanoutPromise
+          fanoutPromise.then((v) => {
+            refreshCache.value = v
+            refreshCache.expiresAt = Date.now() + REFRESH_CACHE_TTL_MS
+            refreshCache.inFlight = null
+          }).catch(() => {
+            refreshCache.inFlight = null
+          })
+        }
+        const cached = await fanoutPromise
+        for (const s of cached) flatten.push(s)
+      } else {
+        // Use cached sessions from heartbeats
+        for (const m of machines) {
+          for (const s of m.sessions ?? []) {
+            flatten.push({ ...s, machineId: m.machineId, machineName: m.name, machineStatus: m.status })
+          }
+        }
+      }
+      // Sort by time desc (ISO strings sort lexicographically in reverse)
+      flatten.sort((a, b) => (b.time ?? '').localeCompare(a.time ?? ''))
+      sendJson(res, 200, { sessions: flatten })
+      return
+    }
+
+    // Route: POST /cluster/action — proxy start/stop to target machine
+    if (method === 'POST' && pathname === '/cluster/action') {
+      if (!deps.clusterProxy) {
+        sendJson(res, 503, { error: 'Cluster proxy not available' })
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const machineId = body.machineId
+      const action = body.action
+      if (typeof machineId !== 'string' || !machineId) {
+        sendJson(res, 400, { error: 'machineId (string) required' })
+        return
+      }
+      if (action !== 'start_session' && action !== 'stop_session') {
+        sendJson(res, 400, { error: 'action must be start_session or stop_session' })
+        return
+      }
+      const actionReq: ClusterActionRequest = {
+        machineId,
+        action,
+        sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+        cwd: typeof body.cwd === 'string' ? body.cwd : undefined,
+      }
+      const result = await deps.clusterProxy.forwardAction(actionReq)
+      sendJson(res, result.status, result.body)
+      return
+    }
+
+    // Route: GET /cluster/stream?machineId=X — SSE proxy
+    if (method === 'GET' && pathname === '/cluster/stream') {
+      if (!deps.clusterProxy) {
+        sendJson(res, 503, { error: 'Cluster proxy not available' })
+        return
+      }
+      const machineId = urlObj.searchParams.get('machineId') ?? ''
+      if (!machineId) {
+        sendJson(res, 400, { error: 'machineId query param required' })
+        return
+      }
+      await deps.clusterProxy.proxyStream(machineId, req, res)
+      return
+    }
+
+    // Route: POST /cluster/migrate — cold session migration via migrator.ts
+    if (method === 'POST' && pathname === '/cluster/migrate') {
+      if (!deps.migrator) {
+        sendJson(res, 503, { error: 'Migration not available' })
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const fromMachineId = body.fromMachineId
+      const toMachineId = body.toMachineId
+      const sessionId = body.sessionId
+      if (typeof fromMachineId !== 'string' || !fromMachineId) {
+        sendJson(res, 400, { error: 'fromMachineId (string) required' }); return
+      }
+      if (typeof toMachineId !== 'string' || !toMachineId) {
+        sendJson(res, 400, { error: 'toMachineId (string) required' }); return
+      }
+      if (typeof sessionId !== 'string' || !sessionId) {
+        sendJson(res, 400, { error: 'sessionId (string) required' }); return
+      }
+      const result = await deps.migrator.migrate({ fromMachineId, toMachineId, sessionId })
+      sendJson(res, result.ok ? 200 : 500, result)
+      return
+    }
+
+    // Route: POST /cluster/message?machineId=X — message proxy
+    if (method === 'POST' && pathname === '/cluster/message') {
+      if (!deps.clusterProxy) {
+        sendJson(res, 503, { error: 'Cluster proxy not available' })
+        return
+      }
+      const machineId = urlObj.searchParams.get('machineId') ?? ''
+      if (!machineId) {
+        sendJson(res, 400, { error: 'machineId query param required' })
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const result = await deps.clusterProxy.proxyMessage(machineId, body)
+      sendJson(res, result.status, result.body)
+      return
+    }
+
+    // Unknown /cluster/* route
+    sendJson(res, 404, { error: 'Unknown cluster route' })
     return
   }
 
