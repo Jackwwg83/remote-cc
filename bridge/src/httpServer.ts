@@ -174,6 +174,39 @@ async function tryServeStatic(urlPath: string, res: ServerResponse): Promise<boo
 
 // Auth check delegates to shared verifyToken from auth.ts
 
+/**
+ * TTL cache for /cluster/sessions?refresh=true.
+ *
+ * Defense against the amplification DoS an adversarial reviewer flagged:
+ * every refresh fans out in parallel to every online client's
+ * /sessions/history, which scans ~/.claude/projects on every target. One
+ * cluster-token holder could loop this endpoint and burn disk/CPU across
+ * the whole cluster.
+ *
+ * Mitigation: share the fan-out result for the window below. Also keeps
+ * a single-in-flight gate so N concurrent refresh callers only trigger
+ * one fan-out. Default window matches the heartbeat period (~30s would
+ * just reuse cached sessions anyway) but we err shorter for staleness.
+ */
+const REFRESH_CACHE_TTL_MS = 5_000
+
+interface RefreshCache<T> {
+  expiresAt: number
+  inFlight: Promise<T> | null
+  value: T | null
+}
+
+function createRefreshCache<T>(): RefreshCache<T> {
+  return { expiresAt: 0, inFlight: null, value: null }
+}
+
+/** Enriched session (session + machine origin) — used in /cluster/sessions. */
+type EnrichedSession = SessionInfo & {
+  machineId: string
+  machineName: string
+  machineStatus: MachineState['status']
+}
+
 /** Timing-safe cluster token check. Accepts Authorization: Bearer or ?token=. */
 function verifyClusterToken(req: IncomingMessage, token: string | undefined): boolean {
   if (!token) return false
@@ -246,9 +279,13 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 // ---------------------------------------------------------------------------
 
 function createRequestHandler(deps: HttpServerDeps) {
+  // Shared per-server refresh cache (only one server instance per process,
+  // so closure state is fine).
+  const refreshCache = createRefreshCache<EnrichedSession[]>()
+
   return function handleRequest(req: IncomingMessage, res: ServerResponse): void {
     // Delegate to async handler, catch unhandled promise rejections
-    handleRequestAsync(req, res, deps).catch((err) => {
+    handleRequestAsync(req, res, deps, refreshCache).catch((err) => {
       console.error('[httpServer] Unhandled error in request handler:', err)
       if (!res.headersSent) {
         sendJson(res, 500, { error: 'Internal Server Error' })
@@ -261,6 +298,7 @@ async function handleRequestAsync(
   req: IncomingMessage,
   res: ServerResponse,
   deps: HttpServerDeps,
+  refreshCache: RefreshCache<Array<SessionInfo & { machineId: string; machineName: string; machineStatus: MachineState['status'] }>>,
 ): Promise<void> {
   const { method } = req
   const rawUrl = req.url ?? '/'
@@ -552,37 +590,63 @@ async function handleRequestAsync(
       const refresh = urlObj.searchParams.get('refresh') === 'true'
       const machines = deps.clusterManager.listMachines()
       const fetchImpl = deps.fetchImpl ?? fetch
-      type EnrichedSession = SessionInfo & {
-        machineId: string
-        machineName: string
-        machineStatus: MachineState['status']
-      }
       const flatten: EnrichedSession[] = []
 
       if (refresh) {
-        // Fan out to online machines' /sessions/history
-        const online = machines.filter((m) => m.status !== 'offline' && m.url && m.sessionToken)
-        const results = await Promise.all(online.map(async (m) => {
-          try {
-            const controller = new AbortController()
-            const timer = setTimeout(() => controller.abort(), 5000)
-            const resp = await fetchImpl(`${m.url.replace(/\/$/, '')}/sessions/history`, {
-              headers: { 'Authorization': `Bearer ${m.sessionToken}` },
-              signal: controller.signal,
-            })
-            clearTimeout(timer)
-            if (!resp.ok) return { m, sessions: [] as SessionInfo[] }
-            const j = await resp.json() as { sessions?: SessionInfo[] }
-            return { m, sessions: j.sessions ?? [] }
-          } catch {
-            return { m, sessions: [] as SessionInfo[] }
-          }
-        }))
-        for (const { m, sessions } of results) {
-          for (const s of sessions) {
-            flatten.push({ ...s, machineId: m.machineId, machineName: m.name, machineStatus: m.status })
-          }
+        // Fan out to online machines' /sessions/history.
+        // Cached + single-in-flight: cluster-token holders can't spam this
+        // to amplify disk/CPU across the whole cluster.
+        const now = Date.now()
+        let fanoutPromise: Promise<EnrichedSession[]>
+        if (refreshCache.value !== null && now < refreshCache.expiresAt) {
+          fanoutPromise = Promise.resolve(refreshCache.value)
+        } else if (refreshCache.inFlight !== null) {
+          fanoutPromise = refreshCache.inFlight
+        } else {
+          const online = machines.filter((m) => m.status !== 'offline' && m.url && m.sessionToken)
+          // Cap parallel fan-out so even a pathologically-large cluster can't
+          // saturate the event loop. 8 is generous for our target scale (~10
+          // machines) and still linear in the worst case.
+          const MAX_PARALLEL = 8
+          fanoutPromise = (async () => {
+            const out: EnrichedSession[] = []
+            for (let i = 0; i < online.length; i += MAX_PARALLEL) {
+              const batch = online.slice(i, i + MAX_PARALLEL)
+              const results = await Promise.all(batch.map(async (m) => {
+                try {
+                  const controller = new AbortController()
+                  const timer = setTimeout(() => controller.abort(), 5000)
+                  const resp = await fetchImpl(`${m.url.replace(/\/$/, '')}/sessions/history`, {
+                    headers: { 'Authorization': `Bearer ${m.sessionToken}` },
+                    signal: controller.signal,
+                  })
+                  clearTimeout(timer)
+                  if (!resp.ok) return { m, sessions: [] as SessionInfo[] }
+                  const j = await resp.json() as { sessions?: SessionInfo[] }
+                  return { m, sessions: j.sessions ?? [] }
+                } catch {
+                  return { m, sessions: [] as SessionInfo[] }
+                }
+              }))
+              for (const { m, sessions } of results) {
+                for (const s of sessions) {
+                  out.push({ ...s, machineId: m.machineId, machineName: m.name, machineStatus: m.status })
+                }
+              }
+            }
+            return out
+          })()
+          refreshCache.inFlight = fanoutPromise
+          fanoutPromise.then((v) => {
+            refreshCache.value = v
+            refreshCache.expiresAt = Date.now() + REFRESH_CACHE_TTL_MS
+            refreshCache.inFlight = null
+          }).catch(() => {
+            refreshCache.inFlight = null
+          })
         }
+        const cached = await fanoutPromise
+        for (const s of cached) flatten.push(s)
       } else {
         // Use cached sessions from heartbeats
         for (const m of machines) {

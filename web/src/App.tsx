@@ -1,7 +1,7 @@
 // T-10/T-13/T-14/T-19-21/T-32-34/T-F10/T-S08: Chat interface with streaming, permission approval, reconnect, session picker for remote-cc web UI
 
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { connectTransport, type TransportState, type ReconnectMeta } from './transport'
+import { connectTransport, type TransportState, type ReconnectMeta, type TransportOptions } from './transport'
 import MessageRenderer, { type ChatMessage } from './MessageRenderer'
 import { createStreamingState, streamingToContent, type StreamingMessage } from './streamingState'
 import PermissionDialog, { type PermissionRequest, type PermissionAction } from './PermissionDialog'
@@ -100,9 +100,23 @@ export default function App() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, streamingMsg])
 
-  // Connect SSE transport on mount
+  // Connect SSE transport.
+  //
+  // Standalone mode: open a single transport against the bridge's own
+  // /events/stream on mount (existing behavior, unchanged).
+  //
+  // Cluster mode: only open a transport when we enter chat view with a
+  // selected target machine (see the SECOND useEffect below). SSE goes
+  // through /cluster/stream?machineId=X via the cluster proxy using the
+  // cluster token (the per-machine sessionToken is redacted from
+  // /cluster/status for security, so we never have direct-connect creds
+  // — always proxy).
   useEffect(() => {
-    const transport = connectTransport(getTransportUrl())
+    if (isClusterMode) return undefined // cluster path handled below
+
+    const baseUrl = getTransportUrl()
+    const opts: TransportOptions = {}
+    const transport = connectTransport(baseUrl, opts)
     wsRef.current = transport
     const ss = streamStateRef.current
 
@@ -315,6 +329,7 @@ export default function App() {
 
     return () => {
       transport.close()
+      wsRef.current = null
       // Clean up rAF on unmount
       if (rafIdRef.current) {
         cancelAnimationFrame(rafIdRef.current)
@@ -326,7 +341,140 @@ export default function App() {
         reconnectedTimerRef.current = null
       }
     }
-  }, [scheduleRender])
+  }, [scheduleRender, isClusterMode])
+
+  // Cluster chat transport: opens when view === 'chat' + targetMachine is set.
+  // Duplicates the handler wiring of the standalone effect above because the
+  // two effects are never simultaneously active (isClusterMode flips the
+  // branch). Kept separate rather than merged to avoid churning the stable
+  // standalone codepath with new dependencies.
+  useEffect(() => {
+    if (!isClusterMode) return undefined
+    if (view !== 'chat') return undefined
+    if (!targetMachine) return undefined
+    const clusterTok = getClusterToken()
+    if (!clusterTok) return undefined
+
+    const u = new URL(window.location.href)
+    u.search = `?token=${encodeURIComponent(clusterTok)}`
+    const baseUrl = u.toString()
+    const opts: TransportOptions = {
+      ssePath: '/cluster/stream',
+      postPath: '/cluster/message',
+      extraQuery: { machineId: targetMachine.machineId },
+    }
+
+    const transport = connectTransport(baseUrl, opts)
+    wsRef.current = transport
+    const ss = streamStateRef.current
+
+    transport.onStateChange((state: TransportState, meta?: ReconnectMeta) => {
+      setStatus(state)
+      setReconnectInfo(state === 'reconnecting' && meta ? meta : null)
+    })
+
+    transport.onMessage((data) => {
+      if (!data || typeof data !== 'object' || !('type' in (data as Record<string, unknown>))) return
+      const d = data as Record<string, unknown>
+
+      if (d.type === 'assistant' && d.subtype === 'partial') {
+        const event = d.event as Record<string, unknown> | undefined
+        if (event?.type === 'message_stop') {
+          ss.handlePartial(data); ss.finalize()
+          if (rafIdRef.current) { cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null }
+          pendingUpdateRef.current = null
+          setStreamingMsg(null)
+          return
+        }
+        const updated = ss.handlePartial(data)
+        if (updated) scheduleRender(updated)
+        return
+      }
+
+      if (d.type === 'assistant' && d.subtype !== 'partial') {
+        ss.reset()
+        if (rafIdRef.current) { cancelAnimationFrame(rafIdRef.current); rafIdRef.current = null }
+        pendingUpdateRef.current = null
+        setStreamingMsg(null)
+
+        // T-M16 tool_progress clear
+        const content = (d.message as Record<string, unknown>)?.content
+        if (Array.isArray(content)) {
+          const resolvedIds = new Set<string>()
+          for (const block of content) {
+            if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'tool_result') {
+              const id = (block as Record<string, unknown>).tool_use_id as string | undefined
+              if (id) resolvedIds.add(id)
+            }
+          }
+          if (resolvedIds.size > 0) {
+            setToolProgress((prev) => {
+              const next = new Map(prev)
+              for (const id of resolvedIds) next.delete(id)
+              return next
+            })
+          }
+        }
+        setMessages((prev) => [...prev, data as ChatMessage])
+        return
+      }
+
+      if (d.type === 'user') {
+        const content = (d.message as Record<string, unknown>)?.content
+        if (typeof content === 'string' && content.trim()) {
+          setMessages((prev) => [...prev, data as ChatMessage])
+        }
+        return
+      }
+
+      if (d.type === 'control_request') {
+        const req = data as PermissionRequest
+        if (req.request?.subtype === 'can_use_tool') {
+          setPendingPerms((prev) => { const next = new Map(prev); next.set(req.request_id, req); return next })
+        }
+        return
+      }
+
+      if (d.type === 'tool_progress' || (d.type === 'system' && d.subtype === 'tool_progress')) {
+        const raw = d as Record<string, unknown>
+        const id = (raw.tool_use_id ?? raw.toolUseId) as string | undefined
+        const toolName = (raw.tool_name ?? raw.toolName ?? 'Tool') as string
+        const elapsed = (raw.elapsed_time_seconds ?? raw.elapsedSeconds ?? 0) as number
+        if (id) {
+          setToolProgress((prev) => { const next = new Map(prev); next.set(id, { toolName, elapsedSeconds: elapsed }); return next })
+        }
+        return
+      }
+
+      if (d.type === 'result') {
+        const result = d as Record<string, unknown>
+        if (result.is_error || result.subtype === 'error') {
+          setMessages((prev) => [...prev, {
+            type: 'system', subtype: 'status',
+            text: `Error: ${(result.result as string) || 'Unknown error'}`,
+          } as unknown as ChatMessage])
+        } else {
+          setMessages((prev) => [...prev, data as ChatMessage])
+          setCumulativeUsage((prev) => {
+            const thisTurn = sumUsage([result as Parameters<typeof sumUsage>[0][number]])
+            return {
+              inputTokens: prev.inputTokens + thisTurn.inputTokens,
+              outputTokens: prev.outputTokens + thisTurn.outputTokens,
+              totalCostUsd: prev.totalCostUsd + thisTurn.totalCostUsd,
+              turnCount: prev.turnCount + thisTurn.turnCount,
+            }
+          })
+        }
+        setToolProgress(new Map())
+        return
+      }
+    })
+
+    return () => {
+      transport.close()
+      wsRef.current = null
+    }
+  }, [isClusterMode, view, targetMachine, scheduleRender])
 
   const sendMessage = useCallback(async () => {
     const text = input.trim()
@@ -472,7 +620,9 @@ export default function App() {
   }, [])
 
   // Cluster mode: start/resume a session on a target machine via /cluster/action.
-  // The bridge's heartbeat will flip status to "running" → UI transitions to chat.
+  // After the action succeeds we move to chat view; the SSE transport useEffect
+  // opens a proxied /cluster/stream?machineId=X connection once view === 'chat'
+  // + targetMachine is set.
   const startClusterSession = useCallback(async (machineId: string, sessionId?: string) => {
     try {
       const body: Record<string, string> = { machineId, action: 'start_session' }
@@ -487,14 +637,18 @@ export default function App() {
         console.error('Cluster start_session failed:', data.error)
         return
       }
-      // For now, jump directly to chat view. Real transport wiring to the
-      // target machine's SSE (via proxy) is handled by a follow-up task —
-      // this gives the user feedback that the request was accepted.
+      // If caller hasn't already set targetMachine, look it up so the
+      // transport effect knows which machine to proxy to.
+      setTargetMachine((prev) => {
+        if (prev && prev.machineId === machineId) return prev
+        const m = dashboardMachines.find((x) => x.machineId === machineId)
+        return m ?? prev
+      })
       setView('chat')
     } catch (err) {
       console.error('Cluster start_session error:', err)
     }
-  }, [])
+  }, [dashboardMachines])
 
   // T-F10: Start a new or existing session via REST API
   const startSession = useCallback(async (sessionId?: string, cwd?: string) => {

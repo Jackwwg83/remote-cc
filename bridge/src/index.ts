@@ -45,6 +45,8 @@ import type { ClusterProxy } from './clusterProxy.js'
 import { createMigrator } from './migrator.js'
 import type { Migrator } from './migrator.js'
 import { platform as osPlatform, hostname as osHostname } from 'node:os'
+import { detectNetworkAddresses } from './terminalUI.js'
+import { pickSelfUrl } from './selfUrl.js'
 
 const { values: args } = parseArgs({
   options: {
@@ -60,6 +62,7 @@ const { values: args } = parseArgs({
     'server-token': { type: 'string' },   // cluster token when role=client
     'machine-name': { type: 'string' },   // display name, defaults to os.hostname()
     'cluster-token': { type: 'string' },  // cluster token when role=server (auto-gen if omitted)
+    'self-url': { type: 'string' },       // advertise this URL to the cluster instead of auto-detecting
   },
 })
 
@@ -90,6 +93,8 @@ Cluster Options:
   --server-token <token>  Cluster token (required for --role client)
   --machine-name <name>   Display name (default: hostname)
   --cluster-token <token> Cluster token for server mode (auto-generated if omitted)
+  --self-url <url>        URL to advertise to the cluster (default: auto-detect Tailscale → LAN → hostname)
+                          Use this when running behind a reverse proxy, NAT, or custom DNS.
   `)
   process.exit(0)
 }
@@ -171,28 +176,77 @@ async function main() {
   let currentMessageHandler: ((msg: Record<string, unknown>) => boolean) | null = null
 
   // -----------------------------------------------------------------------
+  // 3a. Detect Tailscale + LAN address BEFORE any cluster setup so the
+  // registered URL is reachable from other cluster peers (not just a bare
+  // hostname that may not resolve across the network).
+  // -----------------------------------------------------------------------
+  const tailscale = await detectTailscale()
+  const netAddrs = detectNetworkAddresses()
+  const pickedSelf = pickSelfUrl({
+    port,
+    addrs: netAddrs,
+    tailscale,
+    cliOverride: args['self-url'],
+    envOverride: process.env.REMOTE_CC_SELF_URL,
+    fallbackHostname: osHostname(),
+  })
+  if (pickedSelf.source === 'hostname') {
+    console.warn(`   ⚠  Self URL falling back to hostname (${pickedSelf.url}) — other peers may not resolve this. Pass --self-url to override.`)
+  } else if (cluster.role !== 'standalone') {
+    console.log(`   Self URL (${pickedSelf.source}): ${pickedSelf.url}`)
+  }
+
+  // -----------------------------------------------------------------------
   // 3b. If server role, create ClusterManager + ClusterProxy
   // -----------------------------------------------------------------------
   let clusterManager: ClusterManager | null = null
   let clusterProxy: ClusterProxy | null = null
   let migrator: Migrator | null = null
   if (cluster.role === 'server') {
-    const selfUrl = `http://${osHostname()}:${port}`
+    // Short-TTL cache of self's session list so /cluster/status doesn't
+    // fs-scan ~/.claude/projects on every poll call.
+    let cachedSelfSessions: Awaited<ReturnType<typeof scanSessions>> | null = null
+    let cachedSessionsAt = 0
+    const SELF_SESSIONS_TTL_MS = 10_000
+
     clusterManager = await createClusterManager({
       self: {
         machineId: cluster.machineId,
         name: cluster.machineName,
-        url: selfUrl,
+        url: pickedSelf.url,
         sessionToken: token,
         os: osPlatform(),
         hostname: osHostname(),
+      },
+      // Populate the self entry with the server's live pm state + a short-
+      // TTL cache of its own scanSessions() result. Without this the
+      // dashboard always reports the server as idle/no-sessions.
+      getSelfLiveState: () => {
+        const now = Date.now()
+        if (!cachedSelfSessions || now - cachedSessionsAt > SELF_SESSIONS_TTL_MS) {
+          // Fire-and-forget refresh on next tick; return prior snapshot
+          // synchronously so listMachines() never blocks on fs.
+          void scanSessions().then((s) => {
+            cachedSelfSessions = s
+            cachedSessionsAt = Date.now()
+          }).catch(() => { /* keep stale */ })
+        }
+        // Derive project from the active session record if we can find it
+        const activeSessionId = pm.sessionId
+        const activeSession = (cachedSelfSessions ?? []).find((s) => s.id === activeSessionId)
+        return {
+          status: pm.state as 'idle' | 'running' | 'spawning' | 'stopping',
+          sessionId: activeSessionId,
+          project: activeSession?.project,
+          sessions: cachedSelfSessions ?? [],
+        }
       },
     })
     clusterProxy = createClusterProxy({ cluster: clusterManager })
     migrator = createMigrator({
       cluster: clusterManager,
       clusterToken: cluster.clusterToken!,
-      selfServerUrl: selfUrl,
+      selfServerUrl: pickedSelf.url,
     })
     console.log('   Cluster manager started — accepting /cluster/* requests')
   }
@@ -219,9 +273,8 @@ async function main() {
   })
 
   // -----------------------------------------------------------------------
-  // 5. Detect Tailscale + print terminal UI banner (with token in URLs)
+  // 5. Print terminal UI banner (Tailscale was already detected above)
   // -----------------------------------------------------------------------
-  const tailscale = await detectTailscale()
   await printStartupBanner(url, port, token, tailscale, cluster.role === 'server' ? cluster.clusterToken : undefined)
 
   // -----------------------------------------------------------------------
@@ -229,13 +282,12 @@ async function main() {
   // -----------------------------------------------------------------------
   let clusterClient: ClusterClient | null = null
   if (cluster.role === 'client' && cluster.serverUrl && cluster.serverToken) {
-    const selfUrl = `http://${osHostname()}:${port}`
     clusterClient = createClusterClient({
       serverUrl: cluster.serverUrl,
       clusterToken: cluster.serverToken,
       machineId: cluster.machineId,
       machineName: cluster.machineName,
-      selfUrl,
+      selfUrl: pickedSelf.url,
       sessionToken: token,
       os: osPlatform(),
       hostname: osHostname(),

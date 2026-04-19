@@ -99,6 +99,21 @@ export interface ClusterManagerOptions {
     os?: string
     hostname?: string
   }
+  /**
+   * Called from listMachines() to populate the self entry's live state
+   * (status / sessionId / project / sessions). Without this, the server
+   * is always reported as idle with no session metadata, which breaks
+   * dashboard state + migrator's source-session lookup.
+   *
+   * Kept separate from heartbeats because the server doesn't heartbeat
+   * itself — it IS the aggregator.
+   */
+  getSelfLiveState?: () => {
+    status: MachineStatus
+    sessionId?: string
+    project?: string
+    sessions?: SessionInfo[]
+  } | null
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +154,7 @@ export async function createClusterManager(
   const persistDebounceMs = opts?.persistDebounceMs ?? 5_000
   const noPersist = opts?.noPersist ?? false
   const selfConfig = opts?.self ?? null
+  const getSelfLiveState = opts?.getSelfLiveState ?? null
   const persistPath =
     opts?.persistPath ?? join(homedir(), '.remote-cc', 'cluster-state.json')
 
@@ -352,13 +368,26 @@ export async function createClusterManager(
     if (selfConfig) {
       const now = Date.now()
       const existing = machines.get(selfConfig.machineId)
+      // Let the owner bridge inject its live state (status / session).
+      // Default to idle so listMachines() still works without the hook.
+      let live: { status: MachineStatus; sessionId?: string; project?: string; sessions?: SessionInfo[] } = { status: 'idle' }
+      if (getSelfLiveState) {
+        try {
+          const snap = getSelfLiveState()
+          if (snap) live = snap
+        } catch {
+          // Swallow — self should never throw from callback
+        }
+      }
       const selfEntry: MachineState = {
         machineId: selfConfig.machineId,
         name: selfConfig.name,
         url: selfConfig.url,
         sessionToken: selfConfig.sessionToken,
-        status: 'idle',
-        sessions: existing?.sessions ?? [],
+        status: live.status,
+        sessionId: live.sessionId,
+        project: live.project,
+        sessions: live.sessions ?? existing?.sessions ?? [],
         lastSeen: now,
         firstSeen: existing?.firstSeen ?? now,
         os: selfConfig.os,

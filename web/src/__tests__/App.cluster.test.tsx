@@ -17,6 +17,8 @@ type StateCb = (state: string, meta?: unknown) => void
 type MsgCb = (data: unknown) => void
 
 interface MockTransport {
+  url: string
+  options: Record<string, unknown>
   send: ReturnType<typeof vi.fn>
   onMessage: (cb: MsgCb) => void
   onStateChange: (cb: StateCb) => void
@@ -30,14 +32,19 @@ interface MockTransport {
 let transportInstance: MockTransport | null = null
 
 vi.mock('../transport', () => {
-  const messageCbs: MsgCb[] = []
-  const stateCbs: StateCb[] = []
-  const connectTransport = vi.fn(() => {
+  const connectTransport = vi.fn((url: string, options?: Record<string, unknown>) => {
+    const messageCbs: MsgCb[] = []
+    const stateCbs: StateCb[] = []
     const t: MockTransport = {
+      url,
+      options: options ?? {},
       send: vi.fn().mockResolvedValue(true),
       onMessage(cb) { messageCbs.push(cb) },
       onStateChange(cb) { stateCbs.push(cb); cb('connecting') },
-      close: vi.fn(),
+      close: vi.fn(() => {
+        // Clear global ref so callers can observe close
+        if (transportInstance === t) transportInstance = null
+      }),
       reconnect: vi.fn(),
       getLastSeq: () => 0,
       fireMessage(d) { for (const cb of messageCbs) cb(d) },
@@ -121,50 +128,73 @@ describe('App cluster mode view routing', () => {
     expect(screen.queryByText('Select a session')).toBeNull()
   })
 
-  it('stays on dashboard when server\'s SSE emits session_status=waiting_for_session', async () => {
+  it('cluster-mode dashboard does NOT open an SSE transport (no server-session bleed possible)', async () => {
     const AppMod = await import('../App')
     const App = AppMod.default
     render(<App />)
 
+    // Wait long enough for any mount-time effects to run
     await screen.findByText('Machines')
-    await waitFor(() => expect(transportInstance).not.toBeNull())
+    await new Promise((r) => setTimeout(r, 100))
 
-    // Fire the event inside act() so React state updates flush, and
-    // wait for microtasks before asserting. If the isClusterMode guard
-    // were missing, setView('picker') would swap the tree here.
-    await act(async () => {
-      transportInstance!.fireMessage({
-        type: 'system',
-        subtype: 'session_status',
-        state: 'waiting_for_session',
-      })
-      await Promise.resolve()
-    })
-
-    // After the re-render, dashboard is still showing and picker is NOT
+    // Invariant after Fix #1: cluster mode doesn't subscribe to the
+    // server's own /events/stream when on dashboard. The prior regression
+    // where the server's session_status event bounced the user out of
+    // dashboard to the standalone picker is now impossible by construction.
+    expect(transportInstance).toBeNull()
+    // Dashboard is visible; standalone picker heading is not
     expect(screen.getByText('Machines')).toBeTruthy()
     expect(screen.queryByText('Select a session')).toBeNull()
   })
 
-  it('stays on dashboard when server emits session_ended too', async () => {
+  it('cluster-mode chat view opens a proxied SSE transport with machineId + cluster token', async () => {
     const AppMod = await import('../App')
     const App = AppMod.default
+
+    // Pre-seed /cluster/status so the dashboard has a machine to pick
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/cluster/status')) {
+        return Promise.resolve({
+          ok: true, status: 200, headers: new Headers(),
+          json: async () => ({ machines: [{ machineId: 'uuid-1', name: 'Alpha', url: 'http://alpha:7860', status: 'idle', lastSeen: Date.now() }] }),
+          text: async () => '{}',
+        } as unknown as Response)
+      }
+      if (url.includes('/cluster/action')) {
+        return Promise.resolve({
+          ok: true, status: 200, headers: new Headers(),
+          json: async () => ({ ok: true }),
+          text: async () => '{}',
+        } as unknown as Response)
+      }
+      return Promise.resolve({ ok: false, status: 404, headers: new Headers(), json: async () => ({}), text: async () => '' } as unknown as Response)
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
     render(<App />)
     await screen.findByText('Machines')
+    // No transport while on dashboard
+    expect(transportInstance).toBeNull()
+
+    // Click "Sessions" on Alpha to navigate into machine session list,
+    // then "New Session" to route through startClusterSession → chat view
+    const sessionsBtn = await screen.findByRole('button', { name: /Sessions/i })
+    await act(async () => { fireEvent.click(sessionsBtn); await Promise.resolve() })
+    // Now in machineSessions view. Click New Session.
+    const newBtn = await screen.findByRole('button', { name: /New Session/i })
+    await act(async () => { fireEvent.click(newBtn); await new Promise((r) => setTimeout(r, 50)) })
+
+    // Now the second useEffect should have fired → transport opened with
+    // proxy options.
     await waitFor(() => expect(transportInstance).not.toBeNull())
-
-    await act(async () => {
-      transportInstance!.fireMessage({
-        type: 'system',
-        subtype: 'session_status',
-        state: 'session_ended',
-        exitCode: 0,
-      })
-      await Promise.resolve()
-    })
-
-    expect(screen.getByText('Machines')).toBeTruthy()
-    expect(screen.queryByText('Select a session')).toBeNull()
+    // The URL passed to connectTransport must carry cluster_token, and the
+    // options must route SSE + POST through /cluster/* paths.
+    // (The mock's makeMockTransport stores args in the url/options fields.)
+    const mockRec = transportInstance as unknown as { url: string; options: Record<string, unknown> }
+    expect(mockRec.url).toContain('token=clust-tok')
+    expect(mockRec.options.ssePath).toBe('/cluster/stream')
+    expect(mockRec.options.postPath).toBe('/cluster/message')
+    expect((mockRec.options.extraQuery as Record<string, string>).machineId).toBe('uuid-1')
   })
 
   it('system/tool_progress events reach the indicator (not swallowed by the generic system handler)', async () => {

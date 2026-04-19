@@ -251,6 +251,84 @@ describe('httpServer /cluster/* endpoints', () => {
     expect(json.sessions[0]).toMatchObject({ id: 'sess-1', machineId: 'client-1', machineName: 'Client One' })
   })
 
+  it('GET /cluster/sessions?refresh=true caches result for 5s — second refresh hits cache, no new fetches', async () => {
+    cluster.register({
+      machineId: 'client-1',
+      name: 'Client One',
+      url: 'http://c1:7860',
+      sessionToken: 'tok-1',
+    })
+    // Count per-target /sessions/history fetches. Self (server-id) is also
+    // in listMachines so a single fan-out fires 2 fetches (server + client).
+    let historyFetches = 0
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('/sessions/history')) {
+        historyFetches++
+        return makeResponse({ sessions: [{ id: 'live', shortId: 'lv', project: 'p', cwd: '/p', time: '2026-04-18T10:00:00Z', summary: '' }] })
+      }
+      return makeResponse({}, 404)
+    })
+
+    const r1 = await fetch(`${baseUrl}/cluster/sessions?refresh=true`, {
+      headers: { 'Authorization': `Bearer ${CLUSTER_TOKEN}` },
+    })
+    expect(r1.status).toBe(200)
+    const firstCount = historyFetches
+    expect(firstCount).toBeGreaterThan(0)
+
+    // Second refresh immediately — must reuse the cache (zero new fetches)
+    const r2 = await fetch(`${baseUrl}/cluster/sessions?refresh=true`, {
+      headers: { 'Authorization': `Bearer ${CLUSTER_TOKEN}` },
+    })
+    expect(r2.status).toBe(200)
+    // CRITICAL: no new fetches on the cache-hit path
+    expect(historyFetches).toBe(firstCount)
+
+    const j2 = await r2.json() as { sessions: Array<{ id: string }> }
+    expect(j2.sessions.some((s) => s.id === 'live')).toBe(true)
+  })
+
+  it('concurrent refresh=true calls share a single fan-out (in-flight guard)', async () => {
+    cluster.register({
+      machineId: 'client-1',
+      name: 'Client One',
+      url: 'http://c1:7860',
+      sessionToken: 'tok-1',
+    })
+    let historyFetches = 0
+    let resolveFanout: (() => void) | null = null
+    const fanoutGate = new Promise<void>((r) => { resolveFanout = r })
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('/sessions/history')) {
+        historyFetches++
+        await fanoutGate
+        return makeResponse({ sessions: [] })
+      }
+      return makeResponse({}, 404)
+    })
+
+    // Fire 3 concurrent refresh requests while the fan-out is parked
+    const p1 = fetch(`${baseUrl}/cluster/sessions?refresh=true`, {
+      headers: { 'Authorization': `Bearer ${CLUSTER_TOKEN}` },
+    })
+    const p2 = fetch(`${baseUrl}/cluster/sessions?refresh=true`, {
+      headers: { 'Authorization': `Bearer ${CLUSTER_TOKEN}` },
+    })
+    const p3 = fetch(`${baseUrl}/cluster/sessions?refresh=true`, {
+      headers: { 'Authorization': `Bearer ${CLUSTER_TOKEN}` },
+    })
+
+    await new Promise((r) => setTimeout(r, 50))
+    const parkedCount = historyFetches // should reflect ONE fan-out's worth of targets
+    resolveFanout!()
+
+    await Promise.all([p1, p2, p3])
+    // After releasing, total fetches equals the first fan-out's parked count:
+    // the second and third refresh calls piggy-backed on the in-flight promise
+    // instead of triggering fresh fetches. So total === parkedCount (not 3×).
+    expect(historyFetches).toBe(parkedCount)
+  })
+
   it('GET /cluster/sessions?refresh=true fans out to online clients', async () => {
     cluster.register({
       machineId: 'client-1',

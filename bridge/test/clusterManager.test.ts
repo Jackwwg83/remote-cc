@@ -280,6 +280,56 @@ describe('listMachines()', () => {
     await mgr.close()
   })
 
+  it('self entry reflects live state injected by getSelfLiveState callback', async () => {
+    let currentState: { status: 'idle' | 'running'; sessionId?: string; project?: string } = { status: 'idle' }
+    const mgr = await createClusterManager({
+      noPersist: true,
+      self: { machineId: 'srv', name: 'Server', url: 'http://srv:7860', sessionToken: 'tok' },
+      getSelfLiveState: () => currentState,
+    })
+    // Initial: idle, no session
+    let self = mgr.getMachine('srv')!
+    expect(self.status).toBe('idle')
+    expect(self.sessionId).toBeUndefined()
+
+    // Server starts a session — live state changes
+    currentState = { status: 'running', sessionId: 'sess-abc', project: 'demo' }
+    self = mgr.getMachine('srv')!
+    expect(self.status).toBe('running')
+    expect(self.sessionId).toBe('sess-abc')
+    expect(self.project).toBe('demo')
+
+    // Session ends — back to idle
+    currentState = { status: 'idle' }
+    self = mgr.getMachine('srv')!
+    expect(self.status).toBe('idle')
+    expect(self.sessionId).toBeUndefined()
+
+    await mgr.close()
+  })
+
+  it('getSelfLiveState returning null leaves self at idle default', async () => {
+    const mgr = await createClusterManager({
+      noPersist: true,
+      self: { machineId: 'srv', name: 'Server', url: 'http://srv:7860', sessionToken: 'tok' },
+      getSelfLiveState: () => null,
+    })
+    const self = mgr.getMachine('srv')!
+    expect(self.status).toBe('idle')
+    await mgr.close()
+  })
+
+  it('getSelfLiveState throwing does not break listMachines', async () => {
+    const mgr = await createClusterManager({
+      noPersist: true,
+      self: { machineId: 'srv', name: 'Server', url: 'http://srv:7860', sessionToken: 'tok' },
+      getSelfLiveState: () => { throw new Error('boom') },
+    })
+    const self = mgr.getMachine('srv')!
+    expect(self.status).toBe('idle') // survived the throw
+    await mgr.close()
+  })
+
   it('self entry is always idle even after timeout', async () => {
     vi.useFakeTimers()
     const mgr = await createClusterManager({
