@@ -245,7 +245,15 @@ async function main() {
         }
       },
     })
-    clusterProxy = createClusterProxy({ cluster: clusterManager })
+    clusterProxy = createClusterProxy({
+      cluster: clusterManager,
+      // Route self-targeted proxy requests via localhost — the mesh IP
+      // we advertise to other peers often can't loop back to ourselves
+      // (classic Cloudflare WARP / Tailscale behavior where outbound
+      // packets to the host's own mesh IP get black-holed).
+      selfMachineId: cluster.machineId,
+      selfLoopbackUrl: `http://localhost:${port}`,
+    })
     migrator = createMigrator({
       cluster: clusterManager,
       clusterToken: cluster.clusterToken!,

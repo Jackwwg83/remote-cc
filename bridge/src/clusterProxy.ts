@@ -48,6 +48,17 @@ export interface ClusterProxyDeps {
   actionTimeoutMs?: number
   /** POST message timeout in ms. Default: 10_000 */
   messageTimeoutMs?: number
+  /**
+   * The server's own machineId. When a proxy request targets this id,
+   * we rewrite the outgoing URL to `selfLoopbackUrl` instead of the
+   * advertised mesh URL — because on Cloudflare WARP (and some Tailscale
+   * configs) a host cannot fetch its own mesh IP, those packets don't
+   * loop back through the tunnel. Without this rewrite every proxy
+   * call to self times out with "fetch failed".
+   */
+  selfMachineId?: string
+  /** e.g. http://localhost:7860 — reliable loopback for self-target proxy. */
+  selfLoopbackUrl?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -81,7 +92,17 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
     fetchImpl = fetch,
     actionTimeoutMs = 30_000,
     messageTimeoutMs = 10_000,
+    selfMachineId,
+    selfLoopbackUrl,
   } = deps
+
+  /** Pick the outgoing base URL: loopback for self, mesh URL for others. */
+  function targetBaseUrl(m: MachineState): string {
+    if (selfMachineId && m.machineId === selfMachineId && selfLoopbackUrl) {
+      return selfLoopbackUrl
+    }
+    return m.url
+  }
 
   // -------------------------------------------------------------------------
   // 1. forwardAction — POST /cluster/action
@@ -115,7 +136,7 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
     const timer = setTimeout(() => controller.abort(), actionTimeoutMs)
 
     try {
-      const res = await fetchImpl(joinUrl(machine.url, path), {
+      const res = await fetchImpl(joinUrl(targetBaseUrl(machine), path), {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${machine.sessionToken}`,
@@ -206,7 +227,7 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
     if (clientSocket) clientSocket.once('close', onClientGone)
 
     try {
-      const upstream = await fetchImpl(joinUrl(machine.url, '/events/stream') + fromSeqQuery, {
+      const upstream = await fetchImpl(joinUrl(targetBaseUrl(machine), '/events/stream') + fromSeqQuery, {
         method: 'GET',
         headers,
         signal: controller.signal,
@@ -301,7 +322,7 @@ export function createClusterProxy(deps: ClusterProxyDeps) {
     const timer = setTimeout(() => controller.abort(), messageTimeoutMs)
 
     try {
-      const res = await fetchImpl(joinUrl(machine.url, '/messages'), {
+      const res = await fetchImpl(joinUrl(targetBaseUrl(machine), '/messages'), {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${machine.sessionToken}`,

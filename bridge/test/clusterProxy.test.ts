@@ -124,6 +124,41 @@ describe('clusterProxy.forwardAction()', () => {
     expect(result.status).toBe(400)
   })
 
+  it('rewrites outgoing URL to localhost loopback for self-target (WARP/TS self-fetch workaround)', async () => {
+    // On Cloudflare WARP (and some Tailscale setups), a host cannot fetch
+    // its own mesh IP — packets to 100.x that originated on this host
+    // get black-holed by the tunnel. Without this rewrite, clicking the
+    // server's own machine in the dashboard times out 502 Unreachable.
+    const cluster = makeCluster({
+      'srv-self': makeMachine({ machineId: 'srv-self', url: 'http://100.96.0.3:7860' }),
+    })
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse({ ok: true }))
+    const proxy = createClusterProxy({
+      cluster,
+      fetchImpl: fetchMock,
+      selfMachineId: 'srv-self',
+      selfLoopbackUrl: 'http://localhost:7860',
+    })
+    await proxy.forwardAction({ machineId: 'srv-self', action: 'start_session' })
+    // URL must be localhost, not the advertised mesh IP
+    expect(fetchMock.mock.calls[0]![0]).toBe('http://localhost:7860/sessions/start')
+  })
+
+  it('keeps advertised mesh URL when target is NOT self', async () => {
+    const cluster = makeCluster({
+      'other-machine': makeMachine({ machineId: 'other-machine', url: 'http://100.96.0.7:7860' }),
+    })
+    const fetchMock = vi.fn().mockResolvedValue(makeResponse({ ok: true }))
+    const proxy = createClusterProxy({
+      cluster,
+      fetchImpl: fetchMock,
+      selfMachineId: 'srv-self', // different from target
+      selfLoopbackUrl: 'http://localhost:7860',
+    })
+    await proxy.forwardAction({ machineId: 'other-machine', action: 'start_session' })
+    expect(fetchMock.mock.calls[0]![0]).toBe('http://100.96.0.7:7860/sessions/start')
+  })
+
   it('preserves target error status (e.g. 409 already running)', async () => {
     const cluster = makeCluster({ 'machine-a': makeMachine() })
     const fetchMock = vi.fn().mockResolvedValue(makeResponse({ error: 'already running' }, 409))
