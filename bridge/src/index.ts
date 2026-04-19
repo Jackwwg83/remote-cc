@@ -195,6 +195,9 @@ async function main() {
   } else if (cluster.role !== 'standalone') {
     console.log(`   Self URL (${pickedSelf.source}): ${pickedSelf.url}`)
   }
+  if (pickedSelf.warning) {
+    console.warn(`   ⚠  ${pickedSelf.warning}`)
+  }
 
   // -----------------------------------------------------------------------
   // 3b. If server role, create ClusterManager + ClusterProxy

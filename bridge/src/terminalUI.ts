@@ -13,13 +13,27 @@ const VERSION = '0.1.0'
 // Local IP detection
 // ---------------------------------------------------------------------------
 
+/** A single interface → address binding for CGNAT IPs. */
+export interface MeshCandidate {
+  iface: string
+  addr: string
+}
+
 /** Detected network addresses, separated by type. */
 export interface NetworkAddresses {
-  /** Mesh-network IP (Cloudflare WARP, or Tailscale on legacy fleets).
-   *  Both use the 100.64.0.0/10 CGNAT range, so we can't tell them apart
-   *  from the address alone — detectMesh() probes the CLI to identify
-   *  which client is actually running. */
+  /** First-found mesh-network IP (Cloudflare WARP, or Tailscale on legacy
+   *  fleets). Both use the 100.64.0.0/10 CGNAT range, so we can't tell
+   *  them apart from the address alone — detectMesh() probes the CLI to
+   *  identify which client is actually running. Single-string convenience
+   *  for the common (one-client) case; see `meshCandidates` for the full
+   *  list when multiple CGNAT interfaces are active. */
   mesh: string | null
+  /** Every CGNAT interface found. When length > 1 it means both WARP and
+   *  Tailscale are up (or stale tunnels), and a caller that must pick one
+   *  should either match by `iface` name or bail out and require the
+   *  operator to set --self-url — otherwise it risks advertising a
+   *  Tailscale address while reporting kind='warp'. */
+  meshCandidates: MeshCandidate[]
   lan: string | null
 }
 
@@ -34,7 +48,7 @@ export interface NetworkAddresses {
  * TODO: tests for IPv6/multi-interface scenarios (complex to mock os.networkInterfaces)
  */
 export function detectNetworkAddresses(): NetworkAddresses {
-  const result: NetworkAddresses = { mesh: null, lan: null }
+  const result: NetworkAddresses = { mesh: null, meshCandidates: [], lan: null }
   try {
     const nets = networkInterfaces()
     for (const [name, ifaces] of Object.entries(nets)) {
@@ -49,6 +63,7 @@ export function detectNetworkAddresses(): NetworkAddresses {
         const inCGNAT = isMeshAddr && octet2 >= 64 && octet2 <= 127
 
         if ((isMeshIface && isMeshAddr) || inCGNAT) {
+          result.meshCandidates.push({ iface: name, addr: iface.address })
           if (!result.mesh) result.mesh = iface.address
         } else {
           if (!result.lan) result.lan = iface.address

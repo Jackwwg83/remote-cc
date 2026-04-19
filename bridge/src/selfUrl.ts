@@ -39,6 +39,9 @@ export interface PickSelfUrlResult {
   url: string
   /** Which source supplied the URL — useful for startup logging. */
   source: 'cli' | 'env' | 'mesh' | 'lan' | 'hostname'
+  /** Non-fatal note the caller should surface to the user at startup.
+   *  e.g. "multiple mesh clients detected, advertising LAN to be safe". */
+  warning?: string
 }
 
 /** Normalize http(s) URL input: strip trailing slash, verify scheme. */
@@ -68,17 +71,42 @@ export function pickSelfUrl(opts: PickSelfUrlOpts): PickSelfUrlResult {
   }
 
   // 3. Mesh overlay (Cloudflare WARP / Tailscale) — prefer the CLI-reported
-  // IP, fall back to interface scan. BUT: if the mesh CLI explicitly
-  // reports the daemon is NOT connected, an interface-scanned 100.x
-  // address is a stale leftover and won't route. Skip the mesh branch
-  // entirely in that case.
+  // IP, fall back to interface scan. Several guards:
+  //   a. If the mesh CLI explicitly reports NOT connected, a scanned
+  //      100.x address is likely a stale leftover and won't route —
+  //      skip mesh entirely.
+  //   b. If MULTIPLE CGNAT interfaces are up (e.g. both WARP and
+  //      Tailscale connected, or stale tunnels), we can't safely attribute
+  //      the IP to the "winning" client. Rather than risk advertising
+  //      e.g. a Tailscale address while kind='warp' (a WARP-only peer
+  //      won't route there), skip mesh and tell the operator to set
+  //      --self-url. Only bypass when the CLI gave us an exact IP.
   const meshInstalledButOffline =
     opts.mesh?.installed === true && opts.mesh.loggedIn === false
-  const meshIp = meshInstalledButOffline
-    ? null
-    : opts.mesh?.ip ?? opts.addrs.mesh
-  if (meshIp) {
-    return { url: `http://${meshIp}:${opts.port}`, source: 'mesh' }
+  const candidates = opts.addrs.meshCandidates ?? []
+  const cliIp = opts.mesh?.ip ?? null
+
+  if (!meshInstalledButOffline) {
+    if (cliIp) {
+      // Trust the CLI's own answer when it gave us one (tailscale ip -4)
+      return { url: `http://${cliIp}:${opts.port}`, source: 'mesh' }
+    }
+    if (candidates.length === 1) {
+      return { url: `http://${candidates[0].addr}:${opts.port}`, source: 'mesh' }
+    }
+    if (candidates.length > 1) {
+      // Ambiguous — fall through with a loud warning; operator must set
+      // --self-url to resolve. Better to advertise a reachable LAN/hostname
+      // than a potentially wrong 100.x.
+      const list = candidates.map((c) => `${c.iface}=${c.addr}`).join(', ')
+      const warning = `Multiple mesh-overlay interfaces detected (${list}); cannot safely pick one. Set --self-url to override.`
+      // Fall through to LAN/hostname; attach warning to whatever wins.
+      if (opts.addrs.lan) {
+        return { url: `http://${opts.addrs.lan}:${opts.port}`, source: 'lan', warning }
+      }
+      return { url: `http://${opts.fallbackHostname}:${opts.port}`, source: 'hostname', warning }
+    }
+    // candidates.length === 0 and no CLI IP → truly no mesh; fall through
   }
 
   // 4. LAN
