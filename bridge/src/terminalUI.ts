@@ -38,6 +38,34 @@ export interface NetworkAddresses {
 }
 
 /**
+ * Resolve the mesh-overlay IP for startup-banner display (and QR code).
+ * Pure function — exposed for direct unit tests. Mirrors the resolution
+ * order used by pickSelfUrl() for registration, so banner and cluster
+ * self-URL always agree:
+ *
+ *   1. If the mesh CLI says installed-but-not-logged-in, a scanned
+ *      100.x address is a stale leftover and won't route → suppress.
+ *   2. If the CLI gave us a self-reported IP (e.g. `tailscale ip -4`),
+ *      trust it even when other CGNAT interfaces exist.
+ *   3. If exactly one CGNAT interface is live → use its address.
+ *   4. If two or more CGNAT interfaces are live → refuse to pick
+ *      (ambiguous: true). Caller should suppress the mesh URL/QR and
+ *      warn the operator to set --self-url.
+ *   5. Else → no mesh info available.
+ */
+export function resolveBannerMeshIp(
+  mesh: MeshStatus | undefined,
+  candidates: MeshCandidate[],
+): { ip: string | null; ambiguous: boolean } {
+  const offline = mesh?.installed === true && mesh.loggedIn === false
+  if (offline) return { ip: null, ambiguous: false }
+  if (mesh?.ip) return { ip: mesh.ip, ambiguous: false }
+  if (candidates.length === 1) return { ip: candidates[0].addr, ambiguous: false }
+  if (candidates.length > 1) return { ip: null, ambiguous: true }
+  return { ip: null, ambiguous: false }
+}
+
+/**
  * Detect non-internal IPv4 addresses, preferring the mesh overlay address.
  *
  * Mesh interfaces are identified by:
@@ -129,24 +157,13 @@ export async function printStartupBanner(
   if (clusterToken) params.set('cluster_token', clusterToken)
   const qs = params.toString() ? `?${params.toString()}` : ''
 
-  // Resolve the mesh IP for banner + QR with the same ambiguity guard
-  // that pickSelfUrl uses: refuse to pick a CGNAT address when multiple
-  // are live (WARP + Tailscale both connected). Falling back to LAN is
-  // safer than advertising / QR-encoding a potentially wrong 100.x.
+  // Banner + QR use the same resolution as pickSelfUrl so the two stay
+  // in sync: CLI IP → single candidate → 2+ candidates ambiguous →
+  // offline short-circuit. See resolveBannerMeshIp doc for details.
   const candidates = addrs.meshCandidates ?? []
-  const cliIp = mesh?.ip ?? null
-  let meshIp: string | null
-  let meshAmbiguous = false
-  if (cliIp) {
-    meshIp = cliIp // CLI self-reported IP is authoritative
-  } else if (candidates.length === 1) {
-    meshIp = candidates[0].addr
-  } else if (candidates.length > 1) {
-    meshIp = null
-    meshAmbiguous = true
-  } else {
-    meshIp = null
-  }
+  const resolved = resolveBannerMeshIp(mesh, candidates)
+  const meshIp = resolved.ip
+  const meshAmbiguous = resolved.ambiguous
   const meshLabel = mesh?.kind === 'tailscale' ? 'Tailscale' : 'Mesh'
 
   console.log()
