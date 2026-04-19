@@ -446,6 +446,34 @@ export default function App() {
         return
       }
 
+      // session_status for the TARGET machine — unlike standalone mode,
+      // session_ended / waiting_for_session should return to the cluster
+      // machineSessions view (not the standalone picker) so the user can
+      // pick another session on the same machine.
+      if (d.type === 'system' && d.subtype === 'session_status') {
+        const sessionState = d.state as string
+        if (sessionState === 'waiting_for_session' || sessionState === 'session_ended') {
+          setMessages([])
+          setStreamingMsg(null)
+          setPendingPerms(new Map())
+          setToolProgress(new Map())
+          streamStateRef.current.reset()
+          setView('machineSessions')
+        }
+        return
+      }
+
+      // Non-technical system events (api_retry / rate_limit / status) —
+      // surface as inline pills identical to standalone. Technical subtypes
+      // are still filtered via SKIP_SUBTYPES.
+      if (d.type === 'system') {
+        const sub = (d as Record<string, unknown>).subtype as string
+        if (!SKIP_SUBTYPES.has(sub)) {
+          setMessages((prev) => [...prev, data as ChatMessage])
+        }
+        return
+      }
+
       if (d.type === 'result') {
         const result = d as Record<string, unknown>
         if (result.is_error || result.subtype === 'error') {

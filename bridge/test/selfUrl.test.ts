@@ -50,6 +50,19 @@ describe('pickSelfUrl', () => {
     expect(r.url).toBe('http://100.96.0.4:7860')
   })
 
+  it('skips stale Tailscale interface IP when Tailscale CLI says not logged in', () => {
+    // Scenario: tailscale0 iface still has a 100.x address from a previous
+    // login, but `tailscale status` reports loggedIn=false. The interface
+    // IP won't route — we must fall through to LAN.
+    const r = pickSelfUrl({
+      ...base,
+      addrs: { tailscale: '100.64.1.5', lan: '192.168.1.5' },
+      tailscale: { installed: true, loggedIn: false, ip: null } as unknown as Parameters<typeof pickSelfUrl>[0]['tailscale'],
+    })
+    expect(r.url).toBe('http://192.168.1.5:7860')
+    expect(r.source).toBe('lan')
+  })
+
   it('LAN IP used when no tailscale', () => {
     const r = pickSelfUrl({
       ...base,

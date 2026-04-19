@@ -147,6 +147,103 @@ describe('App cluster mode view routing', () => {
     expect(screen.queryByText('Select a session')).toBeNull()
   })
 
+  it('cluster chat session_status=session_ended routes user BACK to machineSessions (not standalone picker)', async () => {
+    // Seed dashboard with a machine
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/cluster/status')) {
+        return Promise.resolve({
+          ok: true, status: 200, headers: new Headers(),
+          json: async () => ({ machines: [{ machineId: 'uuid-1', name: 'Alpha', url: 'http://alpha:7860', status: 'idle', lastSeen: Date.now() }] }),
+          text: async () => '{}',
+        } as unknown as Response)
+      }
+      if (url.includes('/cluster/sessions')) {
+        return Promise.resolve({
+          ok: true, status: 200, headers: new Headers(),
+          json: async () => ({ sessions: [] }),
+          text: async () => '{}',
+        } as unknown as Response)
+      }
+      if (url.includes('/cluster/action')) {
+        return Promise.resolve({
+          ok: true, status: 200, headers: new Headers(),
+          json: async () => ({ ok: true }),
+          text: async () => '{}',
+        } as unknown as Response)
+      }
+      return Promise.resolve({ ok: false, status: 404, headers: new Headers(), json: async () => ({}), text: async () => '' } as unknown as Response)
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const AppMod = await import('../App')
+    const App = AppMod.default
+    render(<App />)
+    await screen.findByText('Machines')
+
+    // Navigate: dashboard → machineSessions → chat via New Session
+    const sessionsBtn = await screen.findByRole('button', { name: /Sessions/i })
+    await act(async () => { fireEvent.click(sessionsBtn); await Promise.resolve() })
+    const newBtn = await screen.findByRole('button', { name: /New Session/i })
+    await act(async () => { fireEvent.click(newBtn); await new Promise((r) => setTimeout(r, 50)) })
+
+    // Transport opened + we're in chat view
+    await waitFor(() => expect(transportInstance).not.toBeNull())
+    expect(screen.getByPlaceholderText(/Type a message|Waiting for connection/i)).toBeTruthy()
+
+    // Remote target emits session_ended — cluster chat must NOT bounce to
+    // the standalone picker ("Select a session"); it must return to the
+    // cluster machineSessions view for the same target.
+    await act(async () => {
+      transportInstance!.fireMessage({
+        type: 'system', subtype: 'session_status', state: 'session_ended', exitCode: 0,
+      })
+      await new Promise((r) => setTimeout(r, 50))
+    })
+
+    // Standalone picker heading is NOT visible
+    expect(screen.queryByText('Select a session')).toBeNull()
+    // machineSessions heading IS visible
+    await waitFor(() => expect(screen.getByText(/Sessions on this machine/i)).toBeTruthy())
+  })
+
+  it('cluster chat surfaces api_retry system pills (T-M21 invariant preserved in proxy path)', async () => {
+    const fetchMock = vi.fn((url: string) => {
+      if (url.includes('/cluster/status')) {
+        return Promise.resolve({
+          ok: true, status: 200, headers: new Headers(),
+          json: async () => ({ machines: [{ machineId: 'uuid-1', name: 'Alpha', url: 'http://alpha:7860', status: 'idle', lastSeen: Date.now() }] }),
+          text: async () => '{}',
+        } as unknown as Response)
+      }
+      if (url.includes('/cluster/action')) {
+        return Promise.resolve({ ok: true, status: 200, headers: new Headers(), json: async () => ({ ok: true }), text: async () => '{}' } as unknown as Response)
+      }
+      return Promise.resolve({ ok: false, status: 404, headers: new Headers(), json: async () => ({}), text: async () => '' } as unknown as Response)
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const AppMod = await import('../App')
+    const App = AppMod.default
+    render(<App />)
+    await screen.findByText('Machines')
+    const sessionsBtn = await screen.findByRole('button', { name: /Sessions/i })
+    await act(async () => { fireEvent.click(sessionsBtn); await Promise.resolve() })
+    const newBtn = await screen.findByRole('button', { name: /New Session/i })
+    await act(async () => { fireEvent.click(newBtn); await new Promise((r) => setTimeout(r, 50)) })
+    await waitFor(() => expect(transportInstance).not.toBeNull())
+
+    // Remote target emits api_retry — should render as a visible pill,
+    // not be silently dropped.
+    await act(async () => {
+      transportInstance!.fireMessage({
+        type: 'system', subtype: 'api_retry',
+        message: { content: 'Retrying after 503...' },
+      })
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(screen.getByText(/Retrying/i)).toBeTruthy())
+  })
+
   it('cluster-mode chat view opens a proxied SSE transport with machineId + cluster token', async () => {
     const AppMod = await import('../App')
     const App = AppMod.default

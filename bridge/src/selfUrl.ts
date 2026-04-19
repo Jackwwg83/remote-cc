@@ -66,8 +66,15 @@ export function pickSelfUrl(opts: PickSelfUrlOpts): PickSelfUrlResult {
     if (norm) return { url: norm, source: 'env' }
   }
 
-  // 3. Tailscale — prefer the CLI-reported IP, fall back to interface scan
-  const tailscaleIp = opts.tailscale?.ip ?? opts.addrs.tailscale
+  // 3. Tailscale — prefer the CLI-reported IP, fall back to interface scan.
+  // BUT: if the Tailscale CLI explicitly reports the daemon is NOT logged
+  // in, an interface-scanned 100.x address is a stale leftover and won't
+  // route. Skip the Tailscale branch entirely in that case.
+  const tsInstalledButOffline =
+    opts.tailscale?.installed === true && opts.tailscale.loggedIn === false
+  const tailscaleIp = tsInstalledButOffline
+    ? null
+    : opts.tailscale?.ip ?? opts.addrs.tailscale
   if (tailscaleIp) {
     return { url: `http://${tailscaleIp}:${opts.port}`, source: 'tailscale' }
   }
