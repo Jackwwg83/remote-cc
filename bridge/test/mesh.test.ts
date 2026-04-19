@@ -12,7 +12,7 @@ vi.mock('node:child_process', () => ({
 }))
 
 import { execFile } from 'node:child_process'
-import { detectMesh, extractCgnatIpFromIfconfig } from '../src/mesh.js'
+import { detectMesh } from '../src/mesh.js'
 
 const mockExecFile = vi.mocked(execFile)
 
@@ -33,74 +33,59 @@ function mockCommand(responses: Record<string, { stdout?: string; error?: Error 
   }) as typeof execFile)
 }
 
-describe('extractCgnatIpFromIfconfig', () => {
-  it('finds a 100.96.x.x address (Cloudflare WARP typical)', () => {
-    const out = `\
-utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
-	inet 100.96.0.4 --> 100.96.0.4 netmask 0xffffffff
-`
-    expect(extractCgnatIpFromIfconfig(out)).toBe('100.96.0.4')
-  })
-
-  it('finds a 100.64.x.x address (Tailscale typical)', () => {
-    const out = `\
-tailscale0: flags=8063 mtu 1280
-	inet 100.64.1.42 --> 100.64.1.42 netmask 0xffffffff
-`
-    expect(extractCgnatIpFromIfconfig(out)).toBe('100.64.1.42')
-  })
-
-  it('ignores non-CGNAT 100.x (e.g. 100.10.x = public)', () => {
-    const out = `\
-en0: flags=8863
-	inet 100.10.1.2 netmask 0xffffff00
-`
-    expect(extractCgnatIpFromIfconfig(out)).toBeNull()
-  })
-
-  it('ignores 100.128.x (past the CGNAT upper bound)', () => {
-    const out = `\
-en0: flags=8863
-	inet 100.128.0.5 netmask 0xffffff00
-`
-    expect(extractCgnatIpFromIfconfig(out)).toBeNull()
-  })
-
-  it('returns null when no matching interface', () => {
-    expect(extractCgnatIpFromIfconfig('no addresses here')).toBeNull()
-  })
-})
-
 describe('detectMesh — warp-cli path (current default)', () => {
   beforeEach(() => { vi.resetAllMocks() })
 
-  it('detects WARP connected + extracts CGNAT IP from ifconfig', async () => {
+  it('detects WARP connected (IP comes from interface scan, not warp-cli)', async () => {
     mockCommand({
       'warp-cli status': { stdout: 'Status update: Connected\nNetwork: healthy\n' },
-      ifconfig: {
-        stdout: 'utun6: flags=8051\n\tinet 100.96.0.4 --> 100.96.0.4 netmask 0xffffffff\n',
-      },
+      // tailscale probes should NOT be reached when warp is healthy
+      'tailscale ip -4': { stdout: '100.64.9.9\n' },
     })
     const r = await detectMesh()
     expect(r).toMatchObject({
       kind: 'warp',
       installed: true,
       loggedIn: true,
-      ip: '100.96.0.4',
+      // IP intentionally null — avoids mis-attributing an arbitrary
+      // CGNAT iface to WARP on hosts with multiple mesh clients.
+      ip: null,
     })
   })
 
-  it('detects WARP installed but disconnected', async () => {
+  it('reports WARP disconnected WITH tailscale fallback when tailscale is healthy', async () => {
+    // Mixed install: WARP present-but-off, Tailscale is the real overlay.
+    // detectMesh must prefer the HEALTHY client, not just the first one
+    // whose CLI is installed.
     mockCommand({
       'warp-cli status': { stdout: 'Status update: Disconnected\n' },
+      'tailscale ip -4': { stdout: '100.64.1.42\n' },
     })
     const r = await detectMesh()
+    expect(r).toMatchObject({ kind: 'tailscale', installed: true, loggedIn: true, ip: '100.64.1.42' })
+  })
+
+  it('reports WARP disconnected when tailscale also unhealthy', async () => {
+    const enoent = new Error('ENOENT') as Error & { code?: string }
+    enoent.code = 'ENOENT'
+    mockCommand({
+      'warp-cli status': { stdout: 'Status update: Disconnected\n' },
+      'tailscale ip -4': { error: enoent },
+      'tailscale status': { error: enoent },
+    })
+    const r = await detectMesh()
+    // WARP is what we have, even though it's disconnected — so the
+    // banner can tell the user to run `warp-cli connect`.
     expect(r).toMatchObject({ kind: 'warp', installed: true, loggedIn: false, ip: null })
   })
 
-  it('treats WARP "Connecting" as not-yet-connected', async () => {
+  it('treats WARP "Connecting" as not-yet-connected, tries tailscale', async () => {
+    const enoent = new Error('ENOENT') as Error & { code?: string }
+    enoent.code = 'ENOENT'
     mockCommand({
       'warp-cli status': { stdout: 'Status update: Connecting\n' },
+      'tailscale ip -4': { error: enoent },
+      'tailscale status': { error: enoent },
     })
     const r = await detectMesh()
     expect(r.loggedIn).toBe(false)

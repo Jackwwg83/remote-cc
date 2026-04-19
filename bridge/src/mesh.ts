@@ -64,27 +64,26 @@ function warpLoggedInFromStatus(status: string): boolean {
 }
 
 /**
- * Pull the mesh IPv4 address from `ifconfig`-style input. Exposed for
- * tests; production callers generally use NetworkAddresses.mesh from
- * terminalUI's interface scan instead, since warp-cli doesn't expose a
- * one-liner for "my WARP IP" on all versions.
+ * Probe status of a mesh client via CLI, WITHOUT attempting to attribute
+ * an IP to a specific client. On a host with multiple utun interfaces
+ * (WARP + Tailscale both running, or WARP connected while a stale
+ * Tailscale tunnel IP is still bound), matching an IP to one client
+ * purely from `ifconfig` output is ambiguous — the first 100.x address
+ * we find may not belong to the client we're reporting.
+ *
+ * We therefore keep CLI detection strict about reachability / kind and
+ * leave IP resolution to the unified interface scan in
+ * `detectNetworkAddresses()`, which pickSelfUrl() falls back to via
+ * `opts.mesh?.ip ?? opts.addrs.mesh`. That avoids the "kind says warp
+ * but IP is Tailscale's" mismatch entirely.
  */
-export function extractCgnatIpFromIfconfig(ifconfigOut: string): string | null {
-  // 100.64.0.0/10 — CGNAT; used by both WARP and Tailscale
-  const re = /^\s*inet\s+(100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+)\b/m
-  const m = ifconfigOut.match(re)
-  return m ? m[1] : null
-}
-
 async function detectWarp(): Promise<MeshStatus | null> {
   const status = await run(WARP_BIN, ['status'])
   if (status === null) return null // binary not installed
   const loggedIn = warpLoggedInFromStatus(status)
-  // warp-cli has no stable "my-ip" command across versions; fall back to
-  // the interface scan done by terminalUI.detectNetworkAddresses.
-  const ifc = loggedIn ? await run('ifconfig', []) : null
-  const ip = ifc ? extractCgnatIpFromIfconfig(ifc) : null
-  return { installed: true, loggedIn, ip, kind: 'warp' }
+  // IP intentionally null — see module comment above; caller picks up
+  // the CGNAT address from detectNetworkAddresses() instead.
+  return { installed: true, loggedIn, ip: null, kind: 'warp' }
 }
 
 async function detectTailscaleFallback(): Promise<MeshStatus | null> {
@@ -99,10 +98,33 @@ async function detectTailscaleFallback(): Promise<MeshStatus | null> {
   return null
 }
 
+/**
+ * Detect which mesh client is *actually providing* the overlay.
+ *
+ * Probing order (HEALTHY client wins, not just "installed"):
+ *   1. If WARP is connected → use WARP.
+ *   2. Else if Tailscale is connected → use Tailscale.
+ *   3. Else if WARP or Tailscale is installed-but-disconnected → report
+ *      whichever we detected (so the banner can show a useful "run X
+ *      connect" hint). Prefer Tailscale's detection if both exist since
+ *      it comes with richer CLI output.
+ *   4. Else → kind='unknown', nothing installed.
+ *
+ * Without step 2 after a disconnected WARP, a mixed-install machine
+ * running Tailscale as its actual overlay would advertise LAN/hostname
+ * instead of the reachable 100.x — breaking the "Tailscale fallback for
+ * mixed fleets" contract.
+ */
 export async function detectMesh(): Promise<MeshStatus> {
   const warp = await detectWarp()
-  if (warp) return warp
+  if (warp && warp.loggedIn) return warp
+
   const ts = await detectTailscaleFallback()
+  if (ts && ts.loggedIn) return ts
+
+  // No healthy client — return whichever we could detect, prefer the one
+  // with richer status (tailscale fallback with ip? warp with kind info?).
   if (ts) return ts
+  if (warp) return warp
   return { installed: false, loggedIn: false, ip: null, kind: 'unknown' }
 }
