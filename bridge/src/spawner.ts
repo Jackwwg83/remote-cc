@@ -56,6 +56,21 @@ export const CLAUDE_ARGS = [
   '--replay-user-messages',
 ] as const
 
+/**
+ * T-M25: Codex CLI args. Codex does NOT speak stream-json, so this is a
+ * best-effort adapter — each turn spawns `codex exec -s workspace-write`
+ * with the prompt read from stdin. The bridge's line reader then forwards
+ * codex's plain-text output as a synthetic `assistant` message.
+ *
+ * For an ongoing / multi-turn experience prefer the claude engine; the
+ * codex path is a stopgap until codex gains a stream-json protocol.
+ */
+export const CODEX_ARGS = [
+  'exec',
+  '-s', 'workspace-write',
+  '--json', // emit json lines (supported on recent codex builds; falls back to text)
+] as const
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
@@ -124,8 +139,10 @@ class ClaudeProcessImpl extends EventEmitter implements ClaudeProcess {
 // Public API
 // ---------------------------------------------------------------------------
 
+export type Engine = 'claude' | 'codex'
+
 export interface SpawnClaudeOptions {
-  /** Override the command name (default: 'claude'). Useful for testing. */
+  /** Override the command name (default depends on engine). Useful for testing. */
   command?: string
   /** Extra CLI arguments appended after the default flags. */
   extraArgs?: string[]
@@ -141,6 +158,13 @@ export interface SpawnClaudeOptions {
   mode?: 'new' | 'resume' | 'continue'
   /** Session ID (full UUID) — required when mode is 'resume'. */
   sessionId?: string
+  /**
+   * T-M25: Which CLI engine to spawn. Defaults to 'claude'. The 'codex'
+   * engine is a best-effort adapter that launches `codex exec -s
+   * workspace-write` per turn; resume/continue modes are NOT supported
+   * on codex because it is not a persistent stream-json session.
+   */
+  engine?: Engine
 }
 
 /**
@@ -153,10 +177,15 @@ export interface SpawnClaudeOptions {
  * @throws SpawnError if mode is 'resume' but sessionId is missing/empty
  */
 export function buildArgs(opts?: SpawnClaudeOptions): string[] {
-  const baseArgs = opts?._rawArgs ?? [...CLAUDE_ARGS]
+  const engine: Engine = opts?.engine ?? 'claude'
+  const baseArgs = opts?._rawArgs
+    ?? (engine === 'codex' ? [...CODEX_ARGS] : [...CLAUDE_ARGS])
   const modeArgs: string[] = []
 
   const mode = opts?.mode ?? 'new'
+  if (engine === 'codex' && (mode === 'resume' || mode === 'continue')) {
+    throw new SpawnError('codex engine does not support resume/continue (no persistent session protocol yet)')
+  }
   if (mode === 'resume') {
     if (!opts?.sessionId) {
       throw new SpawnError('sessionId is required when mode is "resume"')
@@ -182,7 +211,8 @@ export function buildArgs(opts?: SpawnClaudeOptions): string[] {
  *   mode is 'resume' but sessionId is not provided
  */
 export function spawnClaude(cwd: string, opts?: SpawnClaudeOptions): ClaudeProcess {
-  const command = opts?.command ?? 'claude'
+  const engine: Engine = opts?.engine ?? 'claude'
+  const command = opts?.command ?? (engine === 'codex' ? 'codex' : 'claude')
   const args = buildArgs(opts)
 
   const env: NodeJS.ProcessEnv = {

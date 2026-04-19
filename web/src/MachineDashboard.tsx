@@ -33,6 +33,9 @@ interface MachineDashboardProps {
   onStartMachine?: (machine: ClusterMachine) => void
   /** Poll interval in ms. Default 15000 (matches server sweep). */
   pollIntervalMs?: number
+  /** Fires after each successful /cluster/status fetch so parents can
+   *  drive features that depend on the machine list (Quick Task modal etc). */
+  onMachinesLoaded?: (machines: ClusterMachine[]) => void
 }
 
 function statusIcon(status: ClusterMachineStatus): string {
@@ -70,6 +73,7 @@ export default function MachineDashboard({
   onOpenMachine,
   onStartMachine,
   pollIntervalMs = 15_000,
+  onMachinesLoaded,
 }: MachineDashboardProps) {
   const [machines, setMachines] = useState<ClusterMachine[]>([])
   const [loading, setLoading] = useState(true)
@@ -90,14 +94,16 @@ export default function MachineDashboard({
         return
       }
       const data = await res.json() as { machines: ClusterMachine[] }
-      setMachines(data.machines ?? [])
+      const list = data.machines ?? []
+      setMachines(list)
       setError(null)
+      onMachinesLoaded?.(list)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load machines')
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [onMachinesLoaded])
 
   useEffect(() => {
     fetchStatus()

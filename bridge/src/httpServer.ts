@@ -24,6 +24,7 @@ import type { ClaudeProcess, SpawnClaudeOptions } from './spawner.js'
 import { verifyToken } from './auth.js'
 import type { ClusterManager, MachineState } from './clusterManager.js'
 import type { ClusterProxy, ClusterActionRequest } from './clusterProxy.js'
+import type { Migrator } from './migrator.js'
 import { timingSafeEqual } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
@@ -72,6 +73,8 @@ export interface HttpServerDeps {
   clusterManager?: ClusterManager
   /** Cluster proxy (server role only) — enables action/stream/message forwarding. */
   clusterProxy?: ClusterProxy
+  /** Migrator (server role only) — powers POST /cluster/migrate. */
+  migrator?: Migrator
   /** Cluster token (server role only) — auth for /cluster/* endpoints.
    *  Clients and UIs must present this via Authorization header or ?token=. */
   clusterToken?: string
@@ -640,6 +643,36 @@ async function handleRequestAsync(
         return
       }
       await deps.clusterProxy.proxyStream(machineId, req, res)
+      return
+    }
+
+    // Route: POST /cluster/migrate — cold session migration via migrator.ts
+    if (method === 'POST' && pathname === '/cluster/migrate') {
+      if (!deps.migrator) {
+        sendJson(res, 503, { error: 'Migration not available' })
+        return
+      }
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (err) {
+        sendJson(res, 400, { error: typeof err === 'string' ? err : 'Bad request' })
+        return
+      }
+      const fromMachineId = body.fromMachineId
+      const toMachineId = body.toMachineId
+      const sessionId = body.sessionId
+      if (typeof fromMachineId !== 'string' || !fromMachineId) {
+        sendJson(res, 400, { error: 'fromMachineId (string) required' }); return
+      }
+      if (typeof toMachineId !== 'string' || !toMachineId) {
+        sendJson(res, 400, { error: 'toMachineId (string) required' }); return
+      }
+      if (typeof sessionId !== 'string' || !sessionId) {
+        sendJson(res, 400, { error: 'sessionId (string) required' }); return
+      }
+      const result = await deps.migrator.migrate({ fromMachineId, toMachineId, sessionId })
+      sendJson(res, result.ok ? 200 : 500, result)
       return
     }
 

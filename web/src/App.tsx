@@ -13,6 +13,7 @@ import GlobalSessionList, { type GlobalSessionInfo } from './GlobalSessionList'
 import { getClusterToken, getClusterHeaders } from './authUtils'
 import ProgressIndicator from './ProgressIndicator'
 import { parseSlashCommand, sumUsage, type CumulativeUsage } from './SlashCommandHandler'
+import QuickTask from './QuickTask'
 
 /** System subtypes that are internal/technical — never shown in chat.
  *  T-M21: api_retry / rate_limit / rate_limit_event moved OUT so StatusMessage
@@ -71,6 +72,9 @@ export default function App() {
   // T-M18: cumulative usage tracking for /cost command
   const [cumulativeUsage, setCumulativeUsage] = useState<CumulativeUsage>({ inputTokens: 0, outputTokens: 0, totalCostUsd: 0, turnCount: 0 })
   const [showCostOverlay, setShowCostOverlay] = useState(false)
+  // T-M26: Quick Task modal + cached machine list for its dropdown
+  const [showQuickTask, setShowQuickTask] = useState(false)
+  const [dashboardMachines, setDashboardMachines] = useState<ClusterMachine[]>([])
   const bottomRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<ReturnType<typeof connectTransport> | null>(null)
   const streamStateRef = useRef(createStreamingState())
@@ -585,17 +589,29 @@ export default function App() {
       {/* View routing — cluster mode: dashboard → machineSessions → chat;
           standalone: picker → chat */}
       {view === 'dashboard' ? (
-        <MachineDashboard
-          onOpenMachine={(m) => {
-            setTargetMachine(m)
-            setView('machineSessions')
-          }}
-          onStartMachine={(m) => {
-            // Start a new session on this machine via cluster proxy
-            setTargetMachine(m)
-            startClusterSession(m.machineId).catch(console.error)
-          }}
-        />
+        <div className="flex flex-col flex-1 overflow-hidden">
+          <div className="px-4 pt-4 sm:px-6 flex justify-end shrink-0">
+            <button
+              onClick={() => setShowQuickTask(true)}
+              className="px-3 py-1.5 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-500 transition-colors"
+              aria-label="Open quick task modal"
+            >
+              ⚡ Quick Task
+            </button>
+          </div>
+          <MachineDashboard
+            onOpenMachine={(m) => {
+              setTargetMachine(m)
+              setView('machineSessions')
+            }}
+            onStartMachine={(m) => {
+              // Start a new session on this machine via cluster proxy
+              setTargetMachine(m)
+              startClusterSession(m.machineId).catch(console.error)
+            }}
+            onMachinesLoaded={setDashboardMachines}
+          />
+        </div>
       ) : view === 'machineSessions' ? (
         <GlobalSessionList
           machineFilter={targetMachine?.machineId}
@@ -711,6 +727,22 @@ export default function App() {
         const first = pendingPerms.values().next().value as PermissionRequest
         return <PermissionDialog request={first} onRespond={handlePermission} />
       })()}
+
+      {/* T-M26: Quick Task modal */}
+      {showQuickTask && (
+        <QuickTask
+          machines={dashboardMachines}
+          defaultMachineId={targetMachine?.machineId}
+          onClose={() => setShowQuickTask(false)}
+          onSubmitted={(machineId) => {
+            const m = dashboardMachines.find((x) => x.machineId === machineId)
+            if (m) {
+              setTargetMachine(m)
+              setView('chat')
+            }
+          }}
+        />
+      )}
 
       {/* T-M18: /cost overlay — cumulative usage summary */}
       {showCostOverlay && (

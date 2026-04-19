@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup, act } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, act, fireEvent } from '@testing-library/react'
 
 // ---------------------------------------------------------------------------
 // Mock transport BEFORE importing App
@@ -84,6 +84,8 @@ beforeEach(() => {
     },
     configurable: true,
   })
+  // jsdom lacks Element.scrollIntoView
+  Element.prototype.scrollIntoView = vi.fn() as unknown as typeof Element.prototype.scrollIntoView
 
   const fetchMock = vi.fn((url: string) => {
     if (typeof url === 'string' && url.includes('/cluster/status')) {
@@ -201,6 +203,137 @@ describe('App cluster mode view routing', () => {
     // Indicator shows "Running Bash... 7s"
     await waitFor(() => expect(screen.getByText(/Running Bash/i)).toBeTruthy())
     expect(screen.getByText('7s')).toBeTruthy()
+  })
+
+  it('AskUserQuestion submit sends a tool_result with the originating tool_use_id (not plain text)', async () => {
+    Object.defineProperty(window, 'location', {
+      value: { ...window.location, search: '?token=sess-tok', href: 'http://localhost/?token=sess-tok' },
+      writable: true,
+    })
+    vi.resetModules()
+
+    const AppMod = await import('../App')
+    const App = AppMod.default
+    render(<App />)
+
+    await waitFor(() => expect(transportInstance).not.toBeNull())
+
+    // Transition to chat
+    await act(async () => {
+      transportInstance!.fireMessage({ type: 'system', subtype: 'session_status', state: 'running' })
+      await Promise.resolve()
+    })
+
+    // Fire an assistant message carrying an AskUserQuestion tool_use
+    await act(async () => {
+      transportInstance!.fireMessage({
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use',
+              id: 'use-regress-42',
+              name: 'AskUserQuestion',
+              input: { questions: [{ question: 'Q1?', options: [{ label: 'Yes' }, { label: 'No' }] }] },
+            },
+          ],
+        },
+      })
+      await Promise.resolve()
+    })
+
+    // Click option + submit
+    const yesBtn = await screen.findByRole('button', { name: 'Yes' })
+    await act(async () => { fireEvent.click(yesBtn); await Promise.resolve() })
+    const submit = await screen.findByRole('button', { name: /Submit/i })
+    await act(async () => { fireEvent.click(submit); await Promise.resolve() })
+
+    // Assert transport.send was called with the CORRECT protocol shape
+    expect(transportInstance!.send).toHaveBeenCalled()
+    const sentMsg = (transportInstance!.send.mock.calls[0] ?? [])[0] as Record<string, unknown>
+    expect(sentMsg.type).toBe('user')
+    const userMessage = sentMsg.message as Record<string, unknown>
+    expect(Array.isArray(userMessage.content)).toBe(true)
+    const content = userMessage.content as Array<Record<string, unknown>>
+    expect(content).toHaveLength(1)
+    expect(content[0].type).toBe('tool_result')
+    expect(content[0].tool_use_id).toBe('use-regress-42')
+    // Content text contains the Q + A
+    expect(String(content[0].content)).toContain('Yes')
+    expect(String(content[0].content)).toContain('Q1?')
+  })
+
+  it('QuickCommand chip /clear routes through parseSlashCommand (not sent as plain user text)', async () => {
+    Object.defineProperty(window, 'location', {
+      value: { ...window.location, search: '?token=sess-tok', href: 'http://localhost/?token=sess-tok' },
+      writable: true,
+    })
+    vi.resetModules()
+
+    const AppMod = await import('../App')
+    const App = AppMod.default
+    render(<App />)
+    await waitFor(() => expect(transportInstance).not.toBeNull())
+
+    // Flip to chat + connected so QuickCommands renders enabled chips
+    await act(async () => {
+      transportInstance!.fireState('connected')
+      transportInstance!.fireMessage({ type: 'system', subtype: 'session_status', state: 'running' })
+      await Promise.resolve()
+    })
+    // Seed a message so /clear has something to erase
+    await act(async () => {
+      transportInstance!.fireMessage({
+        type: 'assistant',
+        message: { role: 'assistant', content: 'hello before clear' },
+      })
+      await Promise.resolve()
+    })
+    expect(screen.queryByText('hello before clear')).toBeTruthy()
+
+    // Tap the /clear chip
+    const clearChip = await screen.findByRole('button', { name: '/clear' })
+    await act(async () => { fireEvent.click(clearChip); await Promise.resolve() })
+
+    // Assert: no send() call with content === "/clear" (would mean routing regressed)
+    const calls = transportInstance!.send.mock.calls
+    for (const [arg] of calls) {
+      const content = ((arg as Record<string, unknown>)?.message as Record<string, unknown>)?.content
+      expect(content).not.toBe('/clear')
+    }
+    // And the seeded message is gone — confirm clear actually ran
+    await waitFor(() => expect(screen.queryByText('hello before clear')).toBeNull())
+  })
+
+  it('QuickCommand chip /compact sends a control_request with request_id + subtype=compact', async () => {
+    Object.defineProperty(window, 'location', {
+      value: { ...window.location, search: '?token=sess-tok', href: 'http://localhost/?token=sess-tok' },
+      writable: true,
+    })
+    vi.resetModules()
+
+    const AppMod = await import('../App')
+    const App = AppMod.default
+    render(<App />)
+    await waitFor(() => expect(transportInstance).not.toBeNull())
+
+    await act(async () => {
+      transportInstance!.fireState('connected')
+      transportInstance!.fireMessage({ type: 'system', subtype: 'session_status', state: 'running' })
+      await Promise.resolve()
+    })
+
+    const compactChip = await screen.findByRole('button', { name: '/compact' })
+    await act(async () => { fireEvent.click(compactChip); await Promise.resolve() })
+
+    // Find the control_request call
+    const controlCall = transportInstance!.send.mock.calls.find(([arg]) => (arg as Record<string, unknown>)?.type === 'control_request')
+    expect(controlCall).toBeDefined()
+    const msg = controlCall![0] as Record<string, unknown>
+    expect(msg.type).toBe('control_request')
+    expect(typeof msg.request_id).toBe('string')
+    expect((msg.request as Record<string, unknown>).subtype).toBe('compact')
   })
 
   it('negative control: in standalone mode (no cluster_token), waiting_for_session DOES route to picker', async () => {

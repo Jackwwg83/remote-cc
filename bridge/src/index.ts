@@ -42,6 +42,8 @@ import { createClusterManager } from './clusterManager.js'
 import type { ClusterManager } from './clusterManager.js'
 import { createClusterProxy } from './clusterProxy.js'
 import type { ClusterProxy } from './clusterProxy.js'
+import { createMigrator } from './migrator.js'
+import type { Migrator } from './migrator.js'
 import { platform as osPlatform, hostname as osHostname } from 'node:os'
 
 const { values: args } = parseArgs({
@@ -173,6 +175,7 @@ async function main() {
   // -----------------------------------------------------------------------
   let clusterManager: ClusterManager | null = null
   let clusterProxy: ClusterProxy | null = null
+  let migrator: Migrator | null = null
   if (cluster.role === 'server') {
     const selfUrl = `http://${osHostname()}:${port}`
     clusterManager = await createClusterManager({
@@ -186,6 +189,11 @@ async function main() {
       },
     })
     clusterProxy = createClusterProxy({ cluster: clusterManager })
+    migrator = createMigrator({
+      cluster: clusterManager,
+      clusterToken: cluster.clusterToken!,
+      selfServerUrl: selfUrl,
+    })
     console.log('   Cluster manager started — accepting /cluster/* requests')
   }
 
@@ -206,6 +214,7 @@ async function main() {
     machineId: cluster.machineId,
     clusterManager: clusterManager ?? undefined,
     clusterProxy: clusterProxy ?? undefined,
+    migrator: migrator ?? undefined,
     clusterToken: cluster.role === 'server' ? cluster.clusterToken : undefined,
   })
 
