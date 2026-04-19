@@ -7,6 +7,7 @@ import DOMPurify from 'dompurify'
 import 'highlight.js/styles/github-dark.min.css'
 import FileViewer from './FileViewer'
 import DiffViewer from './DiffViewer'
+import CostFooter, { type UsageLike } from './CostFooter'
 
 // Configure marked with highlight.js for code blocks
 marked.setOptions({
@@ -65,30 +66,83 @@ function formatToolParams(name: string, input: unknown): { display: string; isMo
   return { display: JSON.stringify(params, null, 2), isMono: false }
 }
 
-// B-04: AskUserQuestion card — render questions with option buttons
-function AskUserQuestionCard({ questions }: {
-  questions: Array<{ question: string; options: Array<{ label: string; description?: string }> }>
+// T-M19: AskUserQuestion card with interactive option buttons. Clicking an
+// option invokes the onAnswer callback (App.tsx threads a sender that POSTs
+// the selection back as a user message, mirroring what the Claude CLI does).
+interface AskQuestion {
+  question: string
+  options: Array<{ label: string; description?: string }>
+  header?: string
+  multiSelect?: boolean
+}
+
+function AskUserQuestionCard({ questions, onAnswer }: {
+  questions: Array<AskQuestion>
+  onAnswer?: (answers: Array<{ question: string; answer: string }>) => void
 }) {
+  // Local state tracks selections across (potentially multiple) questions
+  const [answers, setAnswers] = useState<Record<number, string>>({})
+  const [submitted, setSubmitted] = useState(false)
+
+  const pickOption = useCallback((qi: number, label: string) => {
+    if (submitted) return
+    setAnswers((prev) => ({ ...prev, [qi]: label }))
+  }, [submitted])
+
+  const submit = useCallback(() => {
+    if (submitted || !onAnswer) return
+    const payload = questions.map((q, qi) => ({
+      question: q.question,
+      answer: answers[qi] ?? '(skipped)',
+    }))
+    onAnswer(payload)
+    setSubmitted(true)
+  }, [answers, onAnswer, questions, submitted])
+
+  const allAnswered = questions.every((_, qi) => answers[qi])
+
   return (
     <div className="bg-blue-50 dark:bg-blue-950/30 rounded-lg p-4 my-2 border border-blue-300 dark:border-blue-700/40 space-y-4">
       {questions.map((q, qi) => (
         <div key={qi}>
           <p className="text-sm font-medium text-blue-800 dark:text-blue-200 mb-2">{q.question}</p>
           <div className="flex flex-wrap gap-2">
-            {q.options.map((opt, oi) => (
-              <button
-                key={oi}
-                className="px-3 py-1.5 rounded-lg text-xs font-medium
-                  bg-blue-100 dark:bg-blue-600/20 text-blue-700 dark:text-blue-300
-                  hover:bg-blue-200 dark:hover:bg-blue-600/40 transition-colors border border-blue-300 dark:border-blue-600/30 cursor-default"
-                title={opt.description}
-              >
-                {opt.label}
-              </button>
-            ))}
+            {q.options.map((opt, oi) => {
+              const picked = answers[qi] === opt.label
+              const disabled = submitted || !onAnswer
+              return (
+                <button
+                  key={oi}
+                  onClick={() => pickOption(qi, opt.label)}
+                  disabled={disabled}
+                  aria-pressed={picked}
+                  className={
+                    'px-3 py-1.5 rounded-lg text-xs font-medium transition-colors border ' +
+                    (picked
+                      ? 'bg-blue-600 text-white border-blue-700 dark:bg-blue-500 dark:border-blue-400'
+                      : 'bg-blue-100 dark:bg-blue-600/20 text-blue-700 dark:text-blue-300 border-blue-300 dark:border-blue-600/30 hover:bg-blue-200 dark:hover:bg-blue-600/40') +
+                    (disabled && !picked ? ' opacity-50 cursor-not-allowed' : '')
+                  }
+                  title={opt.description}
+                >
+                  {opt.label}
+                </button>
+              )
+            })}
           </div>
         </div>
       ))}
+      {onAnswer && (
+        <div className="flex justify-end pt-1">
+          <button
+            onClick={submit}
+            disabled={!allAnswered || submitted}
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 text-white hover:bg-blue-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {submitted ? 'Answered' : 'Submit'}
+          </button>
+        </div>
+      )}
     </div>
   )
 }
@@ -99,15 +153,18 @@ const TOOL_STATUS_LABELS: Record<string, string> = {
   ExitPlanMode: 'Exiting plan mode...',
 }
 
-function ToolUseBlock({ name, input }: { name: string; input: unknown }) {
+function ToolUseBlock({ name, input, onAnswerQuestion }: {
+  name: string
+  input: unknown
+  onAnswerQuestion?: (answers: Array<{ question: string; answer: string }>) => void
+}) {
   const { display, isMono } = useMemo(() => formatToolParams(name, input), [name, input])
 
-  // B-04: Render AskUserQuestion as interactive card
+  // T-M19: Render AskUserQuestion as interactive card with回传
   if (name === 'AskUserQuestion') {
-    const questions = (input as Record<string, unknown>)?.questions as
-      Array<{ question: string; options: Array<{ label: string; description?: string }> }> | undefined
+    const questions = (input as Record<string, unknown>)?.questions as Array<AskQuestion> | undefined
     if (questions && Array.isArray(questions)) {
-      return <AskUserQuestionCard questions={questions} />
+      return <AskUserQuestionCard questions={questions} onAnswer={onAnswerQuestion} />
     }
   }
 
@@ -534,7 +591,10 @@ function ThinkingBlock({ thinking }: { thinking: string }) {
 // --- Content array renderer ---
 
 /** Track the last tool_use name so we can pass it to the next tool_result block */
-function AssistantContent({ content }: { content: unknown }) {
+function AssistantContent({ content, onAnswerQuestion }: {
+  content: unknown
+  onAnswerQuestion?: (answers: Array<{ question: string; answer: string }>) => void
+}) {
   if (typeof content === 'string') {
     return <TextBlock text={content} />
   }
@@ -576,7 +636,7 @@ function AssistantContent({ content }: { content: unknown }) {
           case 'thinking':
             return <ThinkingBlock key={i} thinking={b.thinking as string} />
           case 'tool_use':
-            return <ToolUseBlock key={i} name={b.name as string} input={b.input} />
+            return <ToolUseBlock key={i} name={b.name as string} input={b.input} onAnswerQuestion={onAnswerQuestion} />
           case 'tool_result': {
             const toolId = b.tool_use_id as string | undefined
             const toolName = toolId ? toolNameMap.get(toolId) : undefined
@@ -608,13 +668,19 @@ export interface ChatMessage {
   [key: string]: unknown
 }
 
-export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
+export default function MessageRenderer({
+  msg,
+  onAnswerQuestion,
+}: {
+  msg: ChatMessage
+  onAnswerQuestion?: (answers: Array<{ question: string; answer: string }>) => void
+}) {
   switch (msg.type) {
     case 'assistant':
       return (
         <div className="flex justify-start mb-4">
           <div className="max-w-[85%] sm:max-w-[70%]">
-            <AssistantContent content={msg.message?.content} />
+            <AssistantContent content={msg.message?.content} onAnswerQuestion={onAnswerQuestion} />
             {msg._streaming && (
               <span className="inline-block w-2 h-4 bg-blue-400 animate-pulse rounded-sm ml-0.5 align-text-bottom" />
             )}
@@ -639,16 +705,27 @@ export default function MessageRenderer({ msg }: { msg: ChatMessage }) {
       // T-18: Route system messages by subtype
       return <StatusMessage msg={msg} />
 
-    case 'result':
+    case 'result': {
+      // T-M17: surface usage + cost + duration as a compact footer line
+      const raw = msg as unknown as Record<string, unknown>
+      const usage = raw.usage as UsageLike | undefined
+      const cost = typeof raw.total_cost_usd === 'number' ? raw.total_cost_usd : undefined
+      const duration = typeof raw.duration_ms === 'number' ? raw.duration_ms : undefined
+      const textContent = typeof msg.message?.content === 'string' ? msg.message.content : null
+
       return (
         <div className="flex justify-center mb-4">
-          <p className="text-xs text-gray-400 italic break-words overflow-x-auto">
-            {typeof msg.message?.content === 'string'
-              ? msg.message.content
-              : `Result: ${JSON.stringify(msg.message ?? msg)}`}
-          </p>
+          <div className="flex flex-col items-center max-w-[85%] sm:max-w-[70%]">
+            {textContent && (
+              <p className="text-xs text-gray-400 italic break-words overflow-x-auto">
+                {textContent}
+              </p>
+            )}
+            <CostFooter usage={usage} totalCostUsd={cost} durationMs={duration} />
+          </div>
         </div>
       )
+    }
 
     default:
       // Unknown type: render raw JSON for debugging

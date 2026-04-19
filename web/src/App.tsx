@@ -11,14 +11,17 @@ import SessionPicker from './SessionPicker'
 import MachineDashboard, { type ClusterMachine } from './MachineDashboard'
 import GlobalSessionList, { type GlobalSessionInfo } from './GlobalSessionList'
 import { getClusterToken, getClusterHeaders } from './authUtils'
+import ProgressIndicator from './ProgressIndicator'
+import { parseSlashCommand, sumUsage, type CumulativeUsage } from './SlashCommandHandler'
 
-/** System subtypes that are internal/technical — never shown in chat */
+/** System subtypes that are internal/technical — never shown in chat.
+ *  T-M21: api_retry / rate_limit / rate_limit_event moved OUT so StatusMessage
+ *  can surface them as inline indicators (retry spinner / rate-limit warning). */
 const SKIP_SUBTYPES = new Set([
   'init', 'hook_started', 'hook_response', 'hook_progress',
   'compact_boundary', 'microcompact_boundary',
   'task_started', 'task_progress', 'task_notification',
   'session_state_changed', 'files_persisted',
-  'status', 'api_retry', 'rate_limit', 'rate_limit_event',
   'session_status',
 ])
 
@@ -63,6 +66,11 @@ export default function App() {
   )
   // When in cluster mode, tracks the currently-targeted machine (null = server itself)
   const [targetMachine, setTargetMachine] = useState<ClusterMachine | null>(null)
+  // T-M16: active tool_progress indicators, keyed by tool_use_id
+  const [toolProgress, setToolProgress] = useState<Map<string, { toolName: string; elapsedSeconds: number }>>(new Map())
+  // T-M18: cumulative usage tracking for /cost command
+  const [cumulativeUsage, setCumulativeUsage] = useState<CumulativeUsage>({ inputTokens: 0, outputTokens: 0, totalCostUsd: 0, turnCount: 0 })
+  const [showCostOverlay, setShowCostOverlay] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<ReturnType<typeof connectTransport> | null>(null)
   const streamStateRef = useRef(createStreamingState())
@@ -160,6 +168,28 @@ export default function App() {
         pendingUpdateRef.current = null
         setStreamingMsg(null)
 
+        // T-M16: clear tool_progress for tools whose tool_result arrived
+        const content = (d.message as Record<string, unknown>)?.content
+        if (Array.isArray(content)) {
+          const resolvedIds = new Set<string>()
+          for (const block of content) {
+            if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'tool_result') {
+              const id = (block as Record<string, unknown>).tool_use_id as string | undefined
+              if (id) resolvedIds.add(id)
+            }
+          }
+          if (resolvedIds.size > 0) {
+            setToolProgress((prev) => {
+              let changed = false
+              const next = new Map(prev)
+              for (const id of resolvedIds) {
+                if (next.delete(id)) changed = true
+              }
+              return changed ? next : prev
+            })
+          }
+        }
+
         setMessages((prev) => [...prev, data as ChatMessage])
         return
       }
@@ -224,8 +254,27 @@ export default function App() {
         return
       }
 
-      // Result message: skip — assistant message already contains the reply.
-      // Only show result if it's an error.
+      // T-M16: tool_progress — track in-flight tool execution for UI indicator.
+      // Claude emits these periodically while a tool is running. Matching
+      // tool_result (arriving inside an assistant content array) clears it.
+      if (d.type === 'tool_progress' || (d.type === 'system' && d.subtype === 'tool_progress')) {
+        const raw = d as Record<string, unknown>
+        const id = (raw.tool_use_id ?? raw.toolUseId) as string | undefined
+        const toolName = (raw.tool_name ?? raw.toolName ?? 'Tool') as string
+        const elapsed = (raw.elapsed_time_seconds ?? raw.elapsedSeconds ?? 0) as number
+        if (id) {
+          setToolProgress((prev) => {
+            const next = new Map(prev)
+            next.set(id, { toolName, elapsedSeconds: elapsed })
+            return next
+          })
+        }
+        return
+      }
+
+      // Result message: T-M17 tracks cumulative usage; surface as a result
+      // message so CostFooter renders below the assistant reply. Errors also
+      // surface as a status message (existing behavior).
       if (d.type === 'result') {
         const result = d as Record<string, unknown>
         if (result.is_error || result.subtype === 'error') {
@@ -235,9 +284,26 @@ export default function App() {
             text: `Error: ${(result.result as string) || 'Unknown error'}`,
             _original: data,
           } as unknown as ChatMessage])
+        } else {
+          // Normal result — append as 'result' type so MessageRenderer shows
+          // the CostFooter.
+          setMessages((prev) => [...prev, data as ChatMessage])
+          // Update cumulative totals — simple add to prior running total
+          setCumulativeUsage((prev) => {
+            const thisTurn = sumUsage([result as Parameters<typeof sumUsage>[0][number]])
+            return {
+              inputTokens: prev.inputTokens + thisTurn.inputTokens,
+              outputTokens: prev.outputTokens + thisTurn.outputTokens,
+              totalCostUsd: prev.totalCostUsd + thisTurn.totalCostUsd,
+              turnCount: prev.turnCount + 1,
+            }
+          })
         }
+        // Clear any lingering tool_progress for this turn
+        setToolProgress(new Map())
         return
       }
+
     })
 
     return () => {
@@ -258,6 +324,34 @@ export default function App() {
   const sendMessage = useCallback(async () => {
     const text = input.trim()
     if (!text || !wsRef.current) return
+
+    // T-M18: intercept slash commands before sending
+    const slash = parseSlashCommand(text)
+    if (slash.handled) {
+      setInput('')
+      if (slash.kind === 'clear') {
+        setMessages([])
+        setStreamingMsg(null)
+        setPendingPerms(new Map())
+        streamStateRef.current.reset()
+        if (slash.confirm) {
+          setMessages([{ type: 'system', subtype: 'status', text: slash.confirm } as unknown as ChatMessage])
+        }
+        return
+      }
+      if (slash.kind === 'cost') {
+        setShowCostOverlay(true)
+        return
+      }
+      if (slash.kind === 'noop') {
+        setMessages((prev) => [...prev, { type: 'system', subtype: 'status', text: slash.feedback } as unknown as ChatMessage])
+        return
+      }
+      if (slash.kind === 'send_control') {
+        await wsRef.current.send(slash.controlMsg)
+        return
+      }
+    }
 
     const msg: ChatMessage = {
       type: 'user',
@@ -339,6 +433,23 @@ export default function App() {
     } else {
       console.error('Failed to send permission response — dialog kept for retry')
     }
+  }, [])
+
+  // T-M19: handler for AskUserQuestion option clicks — sends a synthesized
+  // user message back to Claude with the selected answers.
+  const handleAnswerQuestion = useCallback(async (
+    answers: Array<{ question: string; answer: string }>,
+  ) => {
+    if (!wsRef.current) return
+    const summary = answers
+      .map((a) => `Q: ${a.question}\nA: ${a.answer}`)
+      .join('\n\n')
+    await wsRef.current.send({
+      type: 'user',
+      message: { role: 'user', content: summary },
+      parent_tool_use_id: null,
+      session_id: '',
+    })
   }, [])
 
   // Cluster mode: start/resume a session on a target machine via /cluster/action.
@@ -493,11 +604,15 @@ export default function App() {
               <p className="text-gray-500 text-center mt-20">Send a message to get started</p>
             )}
             {messages.map((msg, i) => (
-              <MessageRenderer key={i} msg={msg} />
+              <MessageRenderer key={i} msg={msg} onAnswerQuestion={handleAnswerQuestion} />
             ))}
             {streamingChatMsg && (
-              <MessageRenderer msg={streamingChatMsg} />
+              <MessageRenderer msg={streamingChatMsg} onAnswerQuestion={handleAnswerQuestion} />
             )}
+            {/* T-M16: inline in-flight tool indicators */}
+            {Array.from(toolProgress.entries()).map(([id, p]) => (
+              <ProgressIndicator key={id} toolName={p.toolName} elapsedSeconds={p.elapsedSeconds} />
+            ))}
             <div ref={bottomRef} />
           </main>
 
@@ -551,6 +666,39 @@ export default function App() {
         const first = pendingPerms.values().next().value as PermissionRequest
         return <PermissionDialog request={first} onRespond={handlePermission} />
       })()}
+
+      {/* T-M18: /cost overlay — cumulative usage summary */}
+      {showCostOverlay && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40"
+          onClick={() => setShowCostOverlay(false)}
+        >
+          <div
+            className="bg-white dark:bg-gray-800 rounded-t-2xl sm:rounded-2xl p-5 max-w-md w-full m-2 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-lg font-semibold mb-3">Cumulative usage</h3>
+            <dl className="grid grid-cols-2 gap-y-1 text-sm">
+              <dt className="text-gray-500">Turns</dt>
+              <dd className="font-mono">{cumulativeUsage.turnCount}</dd>
+              <dt className="text-gray-500">Input tokens</dt>
+              <dd className="font-mono">{cumulativeUsage.inputTokens.toLocaleString()}</dd>
+              <dt className="text-gray-500">Output tokens</dt>
+              <dd className="font-mono">{cumulativeUsage.outputTokens.toLocaleString()}</dd>
+              <dt className="text-gray-500">Total cost</dt>
+              <dd className="font-mono">${cumulativeUsage.totalCostUsd.toFixed(4)}</dd>
+            </dl>
+            <button
+              onClick={() => setShowCostOverlay(false)}
+              className="mt-4 w-full px-4 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-500 transition-colors"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* T-28: PWA install prompt */}
       <InstallPrompt />
