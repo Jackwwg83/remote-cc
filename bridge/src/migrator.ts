@@ -86,14 +86,25 @@ export class UnsafePathError extends Error {
   }
 }
 
-const SAFE_PATH_RE = /^\/[A-Za-z0-9_./-]+$/
+/**
+ * Safe path charset: absolute POSIX path with alphanumerics, '_', '-',
+ * '.', '/', plus SPACE. Space is included because macOS paths like
+ * "/Users/alice/My Project" are valid and common. The path is always
+ * shell-quoted before reaching rsync/scp/ssh, so a space can't be
+ * mistaken for an argument separator.
+ *
+ * Shell metacharacters that ARE rejected: $ ` \\ ' " ; | & < > ( ) { }
+ * newline/tab, glob chars [ ] ? *. Those still let a cluster-token
+ * holder break out of the quote or expand variables on the remote side.
+ */
+const SAFE_PATH_RE = /^\/[A-Za-z0-9_. /-]+$/
 
 export function assertSafePath(p: string): void {
   if (typeof p !== 'string' || p.length === 0) {
     throw new UnsafePathError(p, 'empty')
   }
   if (!SAFE_PATH_RE.test(p)) {
-    throw new UnsafePathError(p, 'contains disallowed characters (allowed: A-Za-z0-9 _ . / -)')
+    throw new UnsafePathError(p, 'contains disallowed characters (allowed: A-Za-z0-9, space, _ . / -)')
   }
   if (p.split('/').some((seg) => seg === '..')) {
     throw new UnsafePathError(p, 'path traversal segment ".."')
@@ -215,14 +226,17 @@ export function createMigrator(deps: MigratorDeps) {
     }
 
     // --- 5. scp the .jsonl session file ---
-    const jsonlRelPath = `.claude/projects/${hash}/${req.sessionId}.jsonl`
-    // sessionId format is validated by the caller (Claude UUIDs), and hash is
-    // hex — but still quote for defense in depth.
-    const srcJsonl = `${srcSsh}:${shellQuote('$HOME/' + jsonlRelPath)}`
-    const dstJsonlDir = `$HOME/.claude/projects/${hash}/`
-    steps.push(`scp ${srcJsonl} → ${dstSsh}:${dstJsonlDir}`)
-    // We first ensure the target dir exists via ssh mkdir -p
-    const mkdirRes = await runCommand(spawnImpl, 'ssh', [dstSsh, `mkdir -p ${shellQuote(dstJsonlDir)}`])
+    // cwdHash is hex and sessionId is a UUID — both are safe to interpolate
+    // unquoted. Use leading '~/' so the REMOTE shell expands to $HOME (tilde
+    // is expanded before word splitting even outside quotes).
+    const jsonlRemotePath = `~/.claude/projects/${hash}/${req.sessionId}.jsonl`
+    const jsonlRemoteDir = `~/.claude/projects/${hash}/`
+    const srcJsonl = `${srcSsh}:${jsonlRemotePath}`
+    steps.push(`scp ${srcJsonl} → ${dstSsh}:${jsonlRemoteDir}`)
+    // We first ensure the target dir exists via ssh mkdir -p. The path is
+    // hex + literals, no quoting needed — and we must NOT single-quote
+    // because that would suppress tilde expansion on the remote shell.
+    const mkdirRes = await runCommand(spawnImpl, 'ssh', [dstSsh, `mkdir -p ${jsonlRemoteDir}`])
     if (mkdirRes.code !== 0) {
       return {
         ok: false,
@@ -232,7 +246,7 @@ export function createMigrator(deps: MigratorDeps) {
     }
     // Use scp with -3 to route source→target via this host (server)
     const scpRes = await runCommand(spawnImpl, scpBin, [
-      '-3', srcJsonl, `${dstSsh}:${shellQuote(dstJsonlDir)}`,
+      '-3', srcJsonl, `${dstSsh}:${jsonlRemoteDir}`,
     ])
     if (scpRes.code !== 0) {
       return {

