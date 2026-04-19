@@ -129,8 +129,24 @@ export async function printStartupBanner(
   if (clusterToken) params.set('cluster_token', clusterToken)
   const qs = params.toString() ? `?${params.toString()}` : ''
 
-  // Prefer mesh CLI-reported IP over interface scan.
-  const meshIp = mesh?.ip ?? addrs.mesh
+  // Resolve the mesh IP for banner + QR with the same ambiguity guard
+  // that pickSelfUrl uses: refuse to pick a CGNAT address when multiple
+  // are live (WARP + Tailscale both connected). Falling back to LAN is
+  // safer than advertising / QR-encoding a potentially wrong 100.x.
+  const candidates = addrs.meshCandidates ?? []
+  const cliIp = mesh?.ip ?? null
+  let meshIp: string | null
+  let meshAmbiguous = false
+  if (cliIp) {
+    meshIp = cliIp // CLI self-reported IP is authoritative
+  } else if (candidates.length === 1) {
+    meshIp = candidates[0].addr
+  } else if (candidates.length > 1) {
+    meshIp = null
+    meshAmbiguous = true
+  } else {
+    meshIp = null
+  }
   const meshLabel = mesh?.kind === 'tailscale' ? 'Tailscale' : 'Mesh'
 
   console.log()
@@ -145,6 +161,17 @@ export async function printStartupBanner(
   if (addrs.lan) {
     console.log(
       `   ${chalk.dim('LAN:')}        ${chalk.green(`http://${addrs.lan}:${port}${qs}`)}`,
+    )
+  }
+
+  if (meshAmbiguous) {
+    console.log()
+    const list = candidates.map((c) => `${c.iface}=${c.addr}`).join(', ')
+    console.log(
+      `   ${chalk.yellow('⚠  Multiple mesh interfaces detected:')} ${list}`,
+    )
+    console.log(
+      `   ${chalk.yellow('   Not showing a mesh URL/QR to avoid advertising the wrong IP. Pass --self-url to override.')}`,
     )
   }
 
