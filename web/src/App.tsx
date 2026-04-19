@@ -243,20 +243,10 @@ export default function App() {
         return  // Don't add to messages
       }
 
-      // Filter: only show user-visible system messages
-      if (d.type === 'system') {
-        const sub = (d as Record<string, unknown>).subtype as string
-        // Skip technical messages (init, hooks, compact boundaries)
-        // B-03: Skip all technical/internal system subtypes
-        if (!SKIP_SUBTYPES.has(sub)) {
-          setMessages((prev) => [...prev, data as ChatMessage])
-        }
-        return
-      }
-
-      // T-M16: tool_progress — track in-flight tool execution for UI indicator.
-      // Claude emits these periodically while a tool is running. Matching
-      // tool_result (arriving inside an assistant content array) clears it.
+      // T-M16: tool_progress — check BEFORE the generic system-skip branch
+      // below, since tool_progress arrives as both top-level and as a
+      // system-wrapped subtype depending on the engine version. The generic
+      // system handler returns early, which would otherwise starve this one.
       if (d.type === 'tool_progress' || (d.type === 'system' && d.subtype === 'tool_progress')) {
         const raw = d as Record<string, unknown>
         const id = (raw.tool_use_id ?? raw.toolUseId) as string | undefined
@@ -268,6 +258,17 @@ export default function App() {
             next.set(id, { toolName, elapsedSeconds: elapsed })
             return next
           })
+        }
+        return
+      }
+
+      // Filter: only show user-visible system messages
+      if (d.type === 'system') {
+        const sub = (d as Record<string, unknown>).subtype as string
+        // Skip technical messages (init, hooks, compact boundaries)
+        // B-03: Skip all technical/internal system subtypes
+        if (!SKIP_SUBTYPES.has(sub)) {
+          setMessages((prev) => [...prev, data as ChatMessage])
         }
         return
       }
@@ -288,14 +289,16 @@ export default function App() {
           // Normal result — append as 'result' type so MessageRenderer shows
           // the CostFooter.
           setMessages((prev) => [...prev, data as ChatMessage])
-          // Update cumulative totals — simple add to prior running total
+          // Update cumulative totals. Use sumUsage's turnCount so "turns"
+          // reflect actual token-bearing exchanges — a result with no usage
+          // (e.g. protocol-only no-op) shouldn't bump the counter.
           setCumulativeUsage((prev) => {
             const thisTurn = sumUsage([result as Parameters<typeof sumUsage>[0][number]])
             return {
               inputTokens: prev.inputTokens + thisTurn.inputTokens,
               outputTokens: prev.outputTokens + thisTurn.outputTokens,
               totalCostUsd: prev.totalCostUsd + thisTurn.totalCostUsd,
-              turnCount: prev.turnCount + 1,
+              turnCount: prev.turnCount + thisTurn.turnCount,
             }
           })
         }
@@ -435,9 +438,12 @@ export default function App() {
     }
   }, [])
 
-  // T-M19: handler for AskUserQuestion option clicks — sends a synthesized
-  // user message back to Claude with the selected answers.
+  // T-M19: handler for AskUserQuestion option clicks — sends a tool_result
+  // correlated to the original tool_use_id so Claude's agent loop can link
+  // the answer back to the originating AskUserQuestion call. Sending plain
+  // text without the id leaves the tool call "dangling" in the protocol.
   const handleAnswerQuestion = useCallback(async (
+    toolUseId: string,
     answers: Array<{ question: string; answer: string }>,
   ) => {
     if (!wsRef.current) return
@@ -446,7 +452,16 @@ export default function App() {
       .join('\n\n')
     await wsRef.current.send({
       type: 'user',
-      message: { role: 'user', content: summary },
+      message: {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: toolUseId,
+            content: summary,
+          },
+        ],
+      },
       parent_tool_use_id: null,
       session_id: '',
     })
@@ -622,13 +637,43 @@ export default function App() {
             <QuickCommands
               onCommand={async (cmd) => {
                 if (!wsRef.current || status !== 'connected') return
+                // Route QuickCommand taps through the slash-command parser
+                // so /clear, /cost, /model, /compact, /help all behave the
+                // same as typing the command. Without this, the chip just
+                // sends "/clear" as a raw user message to Claude — which
+                // either replies with its own /clear semantics (wrong) or
+                // treats it as literal text.
+                const slash = parseSlashCommand(cmd)
+                if (slash.handled) {
+                  if (slash.kind === 'clear') {
+                    setMessages([])
+                    setStreamingMsg(null)
+                    setPendingPerms(new Map())
+                    streamStateRef.current.reset()
+                    if (slash.confirm) {
+                      setMessages([{ type: 'system', subtype: 'status', text: slash.confirm } as unknown as ChatMessage])
+                    }
+                    return
+                  }
+                  if (slash.kind === 'cost') {
+                    setShowCostOverlay(true)
+                    return
+                  }
+                  if (slash.kind === 'noop') {
+                    setMessages((prev) => [...prev, { type: 'system', subtype: 'status', text: slash.feedback } as unknown as ChatMessage])
+                    return
+                  }
+                  if (slash.kind === 'send_control') {
+                    await wsRef.current.send(slash.controlMsg)
+                    return
+                  }
+                }
                 const msg: ChatMessage = {
                   type: 'user',
                   message: { role: 'user', content: cmd },
                   parent_tool_use_id: null,
                   session_id: '',
                 }
-                // B-01: No local echo — let server replay add the message
                 const ok = await wsRef.current.send(msg)
                 if (!ok) console.error('Failed to send quick command')
               }}

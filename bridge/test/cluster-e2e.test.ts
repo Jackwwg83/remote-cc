@@ -389,6 +389,118 @@ describe('cluster E2E (2 machines in-process)', () => {
     expect(h.clientPM.startCalls).toHaveLength(0)
   })
 
+  it('T-M27: server restart — client re-registers, persisted state survives', async () => {
+    // Import writeFile/rm dynamically for the test's own temp-file handling
+    const { mkdtemp, rm } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+
+    const tmpDir = await mkdtemp(join(tmpdir(), 'e2e-restart-'))
+    const persistPath = join(tmpDir, 'state.json')
+
+    try {
+      // Tear down the default harness's server so we can swap in a
+      // persisted one at the same port.
+      const serverPort = new URL(h.serverUrl).port
+      await new Promise<void>((r) => h.serverHttp.close(() => r()))
+      await h.serverManager.close()
+
+      // ----- First server incarnation -----
+      const m1 = await createClusterManager({
+        persistPath,
+        persistDebounceMs: 0, // flush every change for deterministic test
+        self: {
+          machineId: 'srv-id',
+          name: 'Server',
+          url: `http://localhost:${serverPort}`,
+          sessionToken: h.serverSessionToken,
+        },
+      })
+      const p1 = createClusterProxy({ cluster: m1 })
+      const { server: http1 } = await startHttpServer(parseInt(serverPort, 10), {
+        authToken: h.serverSessionToken,
+        clusterManager: m1,
+        clusterProxy: p1,
+        clusterToken: CLUSTER_TOKEN,
+      })
+
+      // Client registers + heartbeats "running"
+      h.clusterClient = createClusterClient({
+        serverUrl: h.serverUrl,
+        clusterToken: CLUSTER_TOKEN,
+        machineId: h.clientId,
+        machineName: 'E2E Client',
+        selfUrl: h.clientUrl,
+        sessionToken: h.clientSessionToken,
+        heartbeatIntervalMs: 100,
+      })
+      await h.clusterClient.start()
+      h.clusterClient.updateStatus({ status: 'running', sessionId: 'persist-sess', project: 'persist-proj' })
+      await new Promise((r) => setTimeout(r, 250))
+
+      // Verify state present + persisted
+      expect(m1.getMachine(h.clientId)?.status).toBe('running')
+
+      // ----- Simulate server restart: close server + manager, recreate -----
+      await h.clusterClient.close()
+      await new Promise<void>((r) => http1.close(() => r()))
+      await m1.close()
+
+      // Recreate from the same persistPath
+      const m2 = await createClusterManager({
+        persistPath,
+        persistDebounceMs: 0,
+        self: {
+          machineId: 'srv-id',
+          name: 'Server',
+          url: `http://localhost:${serverPort}`,
+          sessionToken: h.serverSessionToken,
+        },
+      })
+      // After reload, every persisted machine is offline (we've been down)
+      expect(m2.getMachine(h.clientId)?.status).toBe('offline')
+      // Project/sessionId metadata survives so UI doesn't lose context
+      expect(m2.getMachine(h.clientId)?.project).toBe('persist-proj')
+
+      const p2 = createClusterProxy({ cluster: m2 })
+      const { server: http2 } = await startHttpServer(parseInt(serverPort, 10), {
+        authToken: h.serverSessionToken,
+        clusterManager: m2,
+        clusterProxy: p2,
+        clusterToken: CLUSTER_TOKEN,
+      })
+
+      // Client auto re-registers on next heartbeat (server returns 404
+      // for unknown — wait, server KNOWS us via persistence. So heartbeat
+      // accepts with same sessionToken).
+      const newClient = createClusterClient({
+        serverUrl: h.serverUrl,
+        clusterToken: CLUSTER_TOKEN,
+        machineId: h.clientId,
+        machineName: 'E2E Client',
+        selfUrl: h.clientUrl,
+        sessionToken: h.clientSessionToken,
+        heartbeatIntervalMs: 100,
+      })
+      await newClient.start()
+      newClient.updateStatus({ status: 'idle' })
+      await new Promise((r) => setTimeout(r, 250))
+
+      // State restored to idle after heartbeat lands
+      expect(m2.getMachine(h.clientId)?.status).toBe('idle')
+
+      await newClient.close()
+      await new Promise<void>((r) => http2.close(() => r()))
+      await m2.close()
+      // Reset harness refs so teardown() doesn't double-close
+      h.clusterClient = null
+      h.serverHttp = { close: (cb?: () => void) => cb?.() } as unknown as HttpServer
+      h.serverManager = { close: async () => {} } as unknown as ClusterManager
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true })
+    }
+  })
+
   it('GET /cluster/stream proxies SSE frames from client to caller', async () => {
     h.clusterClient = createClusterClient({
       serverUrl: h.serverUrl,

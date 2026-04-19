@@ -22,28 +22,43 @@ describe('parseSlashCommand', () => {
     if (r.handled) expect(r.kind).toBe('cost')
   })
 
-  it('handles /compact → send_control with subtype=compact', () => {
+  it('handles /compact → send_control with subtype=compact AND request_id', () => {
     const r = parseSlashCommand('/compact')
     expect(r.handled).toBe(true)
     if (r.handled && r.kind === 'send_control') {
       expect(r.controlMsg.type).toBe('control_request')
       expect((r.controlMsg.request as Record<string, unknown>).subtype).toBe('compact')
+      // Contract: control_request MUST carry a request_id
+      expect(typeof r.controlMsg.request_id).toBe('string')
+      expect((r.controlMsg.request_id as string).length).toBeGreaterThan(0)
     }
   })
 
-  it('handles /model <name> → send_control with model arg', () => {
+  it('handles /model <name> → set_model subtype (NOT "model") with model arg', () => {
     const r = parseSlashCommand('/model opus-4')
     expect(r.handled).toBe(true)
     if (r.handled && r.kind === 'send_control') {
+      // Contract: the subtype in shared/src/types.ts is 'set_model'
+      expect((r.controlMsg.request as Record<string, unknown>).subtype).toBe('set_model')
       expect((r.controlMsg.request as Record<string, unknown>).model).toBe('opus-4')
+      expect(typeof r.controlMsg.request_id).toBe('string')
     }
   })
 
-  it('handles /model with no arg → no model field', () => {
+  it('handles /model with no arg → set_model subtype, no model field', () => {
     const r = parseSlashCommand('/model')
     expect(r.handled).toBe(true)
     if (r.handled && r.kind === 'send_control') {
+      expect((r.controlMsg.request as Record<string, unknown>).subtype).toBe('set_model')
       expect('model' in (r.controlMsg.request as Record<string, unknown>)).toBe(false)
+    }
+  })
+
+  it('each /compact call generates a unique request_id', () => {
+    const r1 = parseSlashCommand('/compact')
+    const r2 = parseSlashCommand('/compact')
+    if (r1.handled && r1.kind === 'send_control' && r2.handled && r2.kind === 'send_control') {
+      expect(r1.controlMsg.request_id).not.toBe(r2.controlMsg.request_id)
     }
   })
 

@@ -165,6 +165,44 @@ describe('App cluster mode view routing', () => {
     expect(screen.queryByText('Select a session')).toBeNull()
   })
 
+  it('system/tool_progress events reach the indicator (not swallowed by the generic system handler)', async () => {
+    Object.defineProperty(window, 'location', {
+      value: { ...window.location, search: '?token=sess-tok', href: 'http://localhost/?token=sess-tok' },
+      writable: true,
+    })
+    vi.resetModules()
+
+    const AppMod = await import('../App')
+    const App = AppMod.default
+    render(<App />)
+    await waitFor(() => expect(transportInstance).not.toBeNull())
+
+    // Fire a system-wrapped tool_progress event. If the generic system
+    // handler runs first, this returns early and the indicator never appears.
+    await act(async () => {
+      // Flip to chat view first
+      transportInstance!.fireMessage({
+        type: 'system', subtype: 'session_status', state: 'running',
+      })
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      transportInstance!.fireMessage({
+        type: 'system',
+        subtype: 'tool_progress',
+        tool_use_id: 'use-xyz',
+        tool_name: 'Bash',
+        elapsed_time_seconds: 7,
+      })
+      await Promise.resolve()
+    })
+
+    // Indicator shows "Running Bash... 7s"
+    await waitFor(() => expect(screen.getByText(/Running Bash/i)).toBeTruthy())
+    expect(screen.getByText('7s')).toBeTruthy()
+  })
+
   it('negative control: in standalone mode (no cluster_token), waiting_for_session DOES route to picker', async () => {
     // Reset URL to standalone mode
     Object.defineProperty(window, 'location', {

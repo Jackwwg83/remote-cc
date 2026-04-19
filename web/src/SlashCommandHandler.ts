@@ -19,6 +19,17 @@ export type SlashCommandAction =
 /** Known slash commands. Anything else falls through to the bridge unchanged. */
 const KNOWN = new Set(['/clear', '/cost', '/compact', '/model', '/help'])
 
+/** Generate a unique request_id for control_request messages. */
+function newControlRequestId(): string {
+  // crypto.randomUUID is available in browsers + Node >=19. Keep a fallback
+  // for the occasional test environment that hasn't polyfilled it.
+  const g = globalThis as unknown as { crypto?: { randomUUID?: () => string } }
+  if (typeof g.crypto?.randomUUID === 'function') {
+    return `req_${g.crypto.randomUUID()}`
+  }
+  return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+}
+
 export function parseSlashCommand(input: string): SlashCommandAction {
   const trimmed = input.trim()
   if (!trimmed.startsWith('/')) return { handled: false }
@@ -42,24 +53,33 @@ export function parseSlashCommand(input: string): SlashCommandAction {
       return { handled: true, kind: 'cost' }
 
     case '/compact':
+      // Claude protocol: control_request requires a request_id. /compact
+      // isn't one of the documented subtypes, but the string-fallback in
+      // ControlRequestInner allows transport through — the engine either
+      // handles it or rejects with a control_response.
       return {
         handled: true,
         kind: 'send_control',
         controlMsg: {
           type: 'control_request',
+          request_id: newControlRequestId(),
           request: { subtype: 'compact' },
         },
       }
 
     case '/model': {
-      // /model foo → request change to model foo
-      // /model (no args) → request current model info
-      const request: Record<string, unknown> = { subtype: 'model' }
+      // /model foo → switch to model "foo"; /model (no args) → query current
+      // Subtype is `set_model` per shared/src/types.ts ControlRequestInner.
+      const request: Record<string, unknown> = { subtype: 'set_model' }
       if (args) request.model = args
       return {
         handled: true,
         kind: 'send_control',
-        controlMsg: { type: 'control_request', request },
+        controlMsg: {
+          type: 'control_request',
+          request_id: newControlRequestId(),
+          request,
+        },
       }
     }
 

@@ -153,18 +153,25 @@ const TOOL_STATUS_LABELS: Record<string, string> = {
   ExitPlanMode: 'Exiting plan mode...',
 }
 
-function ToolUseBlock({ name, input, onAnswerQuestion }: {
+function ToolUseBlock({ name, input, toolUseId, onAnswerQuestion }: {
   name: string
   input: unknown
-  onAnswerQuestion?: (answers: Array<{ question: string; answer: string }>) => void
+  toolUseId?: string
+  onAnswerQuestion?: (toolUseId: string, answers: Array<{ question: string; answer: string }>) => void
 }) {
   const { display, isMono } = useMemo(() => formatToolParams(name, input), [name, input])
 
-  // T-M19: Render AskUserQuestion as interactive card with回传
+  // T-M19: Render AskUserQuestion as interactive card with tool_result 回传
   if (name === 'AskUserQuestion') {
     const questions = (input as Record<string, unknown>)?.questions as Array<AskQuestion> | undefined
     if (questions && Array.isArray(questions)) {
-      return <AskUserQuestionCard questions={questions} onAnswer={onAnswerQuestion} />
+      // Adapter: AskUserQuestionCard knows nothing about tool_use_id — the
+      // parent binds it into the callback here so App.tsx can construct a
+      // correctly-correlated tool_result reply.
+      const onAnswer = onAnswerQuestion && toolUseId
+        ? (answers: Array<{ question: string; answer: string }>) => onAnswerQuestion(toolUseId, answers)
+        : undefined
+      return <AskUserQuestionCard questions={questions} onAnswer={onAnswer} />
     }
   }
 
@@ -593,7 +600,7 @@ function ThinkingBlock({ thinking }: { thinking: string }) {
 /** Track the last tool_use name so we can pass it to the next tool_result block */
 function AssistantContent({ content, onAnswerQuestion }: {
   content: unknown
-  onAnswerQuestion?: (answers: Array<{ question: string; answer: string }>) => void
+  onAnswerQuestion?: (toolUseId: string, answers: Array<{ question: string; answer: string }>) => void
 }) {
   if (typeof content === 'string') {
     return <TextBlock text={content} />
@@ -636,7 +643,13 @@ function AssistantContent({ content, onAnswerQuestion }: {
           case 'thinking':
             return <ThinkingBlock key={i} thinking={b.thinking as string} />
           case 'tool_use':
-            return <ToolUseBlock key={i} name={b.name as string} input={b.input} onAnswerQuestion={onAnswerQuestion} />
+            return <ToolUseBlock
+              key={i}
+              name={b.name as string}
+              input={b.input}
+              toolUseId={typeof b.id === 'string' ? b.id : undefined}
+              onAnswerQuestion={onAnswerQuestion}
+            />
           case 'tool_result': {
             const toolId = b.tool_use_id as string | undefined
             const toolName = toolId ? toolNameMap.get(toolId) : undefined
@@ -673,7 +686,7 @@ export default function MessageRenderer({
   onAnswerQuestion,
 }: {
   msg: ChatMessage
-  onAnswerQuestion?: (answers: Array<{ question: string; answer: string }>) => void
+  onAnswerQuestion?: (toolUseId: string, answers: Array<{ question: string; answer: string }>) => void
 }) {
   switch (msg.type) {
     case 'assistant':

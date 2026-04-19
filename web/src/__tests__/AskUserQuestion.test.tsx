@@ -57,7 +57,7 @@ describe('AskUserQuestion interactive card', () => {
     expect(submit.disabled).toBe(false)
   })
 
-  it('clicking Submit fires onAnswer with all selected labels', () => {
+  it('clicking Submit fires onAnswer with the tool_use_id AND selected labels', () => {
     const onAnswer = vi.fn()
     const msg = makeAssistantMsg([
       { question: 'Color?', options: [{ label: 'Red' }, { label: 'Blue' }] },
@@ -65,7 +65,11 @@ describe('AskUserQuestion interactive card', () => {
     render(<MessageRenderer msg={msg} onAnswerQuestion={onAnswer} />)
     fireEvent.click(screen.getByRole('button', { name: 'Blue' }))
     fireEvent.click(screen.getByRole('button', { name: /Submit/i }))
-    expect(onAnswer).toHaveBeenCalledWith([{ question: 'Color?', answer: 'Blue' }])
+    // Callback signature: (toolUseId, answers[])
+    expect(onAnswer).toHaveBeenCalledWith(
+      'use-1',
+      [{ question: 'Color?', answer: 'Blue' }],
+    )
   })
 
   it('second Submit click does nothing (locked after first submission)', () => {
