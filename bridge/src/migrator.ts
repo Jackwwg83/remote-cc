@@ -99,6 +99,23 @@ export class UnsafePathError extends Error {
  */
 const SAFE_PATH_RE = /^\/[A-Za-z0-9_. /-]+$/
 
+/**
+ * Session IDs in Claude Code are UUIDs (8-4-4-4-12 hex). The scp leg
+ * interpolates the id into a remote path unquoted (for tilde expansion),
+ * so non-UUID ids could re-open the shell-injection hole. Validate
+ * strictly even if the caller already thinks they have a UUID.
+ */
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
+
+export function assertSafeSessionId(id: string): void {
+  if (typeof id !== 'string' || id.length === 0) {
+    throw new UnsafePathError(id, 'session id empty')
+  }
+  if (!SESSION_ID_RE.test(id)) {
+    throw new UnsafePathError(id, 'session id must match [A-Za-z0-9][A-Za-z0-9_-]{0,127} (typical UUID format)')
+  }
+}
+
 export function assertSafePath(p: string): void {
   if (typeof p !== 'string' || p.length === 0) {
     throw new UnsafePathError(p, 'empty')
@@ -167,6 +184,14 @@ export function createMigrator(deps: MigratorDeps) {
     if (dst.status === 'offline') return { ok: false, error: `target ${dst.name} is offline`, steps }
 
     // --- 2. Find the session record on source ---
+    // SECURITY: validate sessionId before we even look it up. Pollutes
+    // the remote scp path as `~/.claude/projects/{hash}/{sessionId}.jsonl`,
+    // so a non-UUID id could break out of the path.
+    try {
+      assertSafeSessionId(req.sessionId)
+    } catch (err) {
+      return { ok: false, error: `unsafe sessionId: ${(err as Error).message}`, steps }
+    }
     const session = (src.sessions ?? []).find((s) => s.id === req.sessionId)
     if (!session) {
       return { ok: false, error: `session ${req.sessionId} not found on source`, steps }

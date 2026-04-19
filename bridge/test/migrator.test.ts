@@ -6,7 +6,7 @@
 
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { EventEmitter } from 'node:events'
-import { createMigrator, cwdHash, assertSafePath, UnsafePathError, shellQuote } from '../src/migrator.js'
+import { createMigrator, cwdHash, assertSafePath, assertSafeSessionId, UnsafePathError, shellQuote } from '../src/migrator.js'
 import type { ClusterManager, MachineState } from '../src/clusterManager.js'
 
 // ---------------------------------------------------------------------------
@@ -129,6 +129,44 @@ describe('assertSafePath (shell-injection defense)', () => {
 
   it('rejects empty string', () => {
     expect(() => assertSafePath('')).toThrow(UnsafePathError)
+  })
+})
+
+describe('assertSafeSessionId', () => {
+  it('accepts canonical UUIDs', () => {
+    expect(() => assertSafeSessionId('abc-123-def-456')).not.toThrow()
+    expect(() => assertSafeSessionId('550e8400-e29b-41d4-a716-446655440000')).not.toThrow()
+  })
+
+  it('rejects empty + undefined-looking IDs', () => {
+    expect(() => assertSafeSessionId('')).toThrow(UnsafePathError)
+    expect(() => assertSafeSessionId('undefined')).not.toThrow()
+  })
+
+  it('rejects shell metacharacters', () => {
+    const bad = ['id;rm', 'id`pwd`', 'id$HOME', 'id with space', 'id|cat', "id'", 'id"', '../etc']
+    for (const id of bad) {
+      expect(() => assertSafeSessionId(id)).toThrow(UnsafePathError)
+    }
+  })
+})
+
+describe('migrate() rejects malicious sessionId before any spawn', () => {
+  it('a sessionId with shell metacharacters is caught by validator', async () => {
+    const cluster = makeCluster({
+      src: makeMachine({
+        machineId: 'src',
+        sessions: [{ id: 'safe-id', shortId: 'sfid', project: 'p', cwd: '/tmp/p', time: '2026-01-01', summary: '' }],
+      }),
+      dst: makeMachine({ machineId: 'dst' }),
+    })
+    const { spawnImpl, calls } = makeSpawnMock([])
+    const mig = createMigrator({ cluster, spawnImpl, fetchImpl: vi.fn(), clusterToken: 'tok', selfServerUrl: 'http://s' })
+    const r = await mig.migrate({ fromMachineId: 'src', toMachineId: 'dst', sessionId: 's1; rm -rf ~' })
+    expect(r.ok).toBe(false)
+    expect(r.error).toMatch(/unsafe sessionId/i)
+    // No spawn happened — validation runs before any side effect
+    expect(calls).toHaveLength(0)
   })
 })
 
