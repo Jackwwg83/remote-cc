@@ -12,7 +12,7 @@
  *
  * Everything runs as child processes on the server host, so rsync and ssh
  * must be installed + configured with passwordless auth between machines
- * (standard Tailscale SSH setup).
+ * (standard mesh SSH setup — Cloudflare WARP's SSH or Tailscale SSH both work).
  *
  * This is intentionally a pure-orchestration module — it does NOT own
  * cluster state; it reads from a ClusterManager snapshot and writes back

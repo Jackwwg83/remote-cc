@@ -84,7 +84,7 @@ When Claude needs to run a tool (read file, write file, run command), a permissi
 - Token required on all API endpoints (Bearer header or ?token= query param)
 - Path traversal protection on static file serving
 - POST message idempotency with `_messageId` dedup
-- No data leaves your machine ... direct connection via LAN or Tailscale
+- No data leaves your machine ... direct connection via LAN or mesh overlay (Cloudflare WARP / Tailscale)
 
 ## Requirements
 
@@ -92,7 +92,9 @@ When Claude needs to run a tool (read file, write file, run command), a permissi
 - Node.js >= 18
 - A way to connect your phone to your machine:
   - **Same WiFi** ... use the LAN IP shown in the terminal
-  - **[Tailscale](https://tailscale.com/)** ... install on both devices for secure access from anywhere
+  - **Mesh overlay** — install on both devices for secure access from anywhere:
+    - **[Cloudflare WARP / Zero Trust](https://1.1.1.1/)** (current default — what this project uses)
+    - **[Tailscale](https://tailscale.com/)** (also supported; auto-detected as a fallback)
 
 ## CLI Options
 
@@ -163,8 +165,8 @@ cd web && npm run build
 
 ## FAQ
 
-**Q: Does this work without a Tailscale/Claude subscription?**
-A: Yes. You just need `claude` CLI installed with a valid API key. No paid subscription required. Connect via your local WiFi network.
+**Q: Does this work without a mesh overlay / Claude subscription?**
+A: Yes. You just need `claude` CLI installed with a valid API key. No paid subscription required. Connect via your local WiFi network. Mesh overlay (Cloudflare WARP or Tailscale) is only needed when you're away from home.
 
 **Q: Is my data sent to any server?**
 A: No. Everything stays on your machine. The bridge runs locally and your phone connects directly to it.

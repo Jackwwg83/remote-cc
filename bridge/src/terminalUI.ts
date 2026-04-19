@@ -5,7 +5,7 @@
 import chalk from 'chalk'
 import { networkInterfaces } from 'node:os'
 import QRCode from 'qrcode'
-import type { TailscaleStatus } from './tailscale.js'
+import type { MeshStatus } from './mesh.js'
 
 const VERSION = '0.1.0'
 
@@ -15,21 +15,26 @@ const VERSION = '0.1.0'
 
 /** Detected network addresses, separated by type. */
 export interface NetworkAddresses {
-  tailscale: string | null
+  /** Mesh-network IP (Cloudflare WARP, or Tailscale on legacy fleets).
+   *  Both use the 100.64.0.0/10 CGNAT range, so we can't tell them apart
+   *  from the address alone — detectMesh() probes the CLI to identify
+   *  which client is actually running. */
+  mesh: string | null
   lan: string | null
 }
 
 /**
- * Detect non-internal IPv4 addresses, preferring Tailscale.
+ * Detect non-internal IPv4 addresses, preferring the mesh overlay address.
  *
- * Tailscale interfaces are identified by:
- * - Interface name: `tailscale0` (Linux), `utun*` (macOS)
- * - Address in the Tailscale CGNAT range: 100.64.0.0/10
+ * Mesh interfaces are identified by:
+ * - Interface name: `utun*` (macOS — used by both Cloudflare WARP and
+ *   Tailscale) or `tailscale0` (Linux, Tailscale-specific)
+ * - Address in the 100.64.0.0/10 CGNAT range (shared by both)
  *
  * TODO: tests for IPv6/multi-interface scenarios (complex to mock os.networkInterfaces)
  */
 export function detectNetworkAddresses(): NetworkAddresses {
-  const result: NetworkAddresses = { tailscale: null, lan: null }
+  const result: NetworkAddresses = { mesh: null, lan: null }
   try {
     const nets = networkInterfaces()
     for (const [name, ifaces] of Object.entries(nets)) {
@@ -37,14 +42,14 @@ export function detectNetworkAddresses(): NetworkAddresses {
       for (const iface of ifaces) {
         if (iface.family !== 'IPv4' || iface.internal) continue
 
-        const isTailscaleIface = name === 'tailscale0' || name.startsWith('utun')
-        const isTailscaleAddr = iface.address.startsWith('100.')
-        // Tailscale CGNAT range: 100.64.0.0 – 100.127.255.255
+        const isMeshIface = name === 'tailscale0' || name.startsWith('utun')
+        const isMeshAddr = iface.address.startsWith('100.')
+        // CGNAT range: 100.64.0.0 – 100.127.255.255 (shared by WARP + Tailscale)
         const octet2 = parseInt(iface.address.split('.')[1], 10)
-        const inCGNAT = isTailscaleAddr && octet2 >= 64 && octet2 <= 127
+        const inCGNAT = isMeshAddr && octet2 >= 64 && octet2 <= 127
 
-        if ((isTailscaleIface && isTailscaleAddr) || inCGNAT) {
-          if (!result.tailscale) result.tailscale = iface.address
+        if ((isMeshIface && isMeshAddr) || inCGNAT) {
+          if (!result.mesh) result.mesh = iface.address
         } else {
           if (!result.lan) result.lan = iface.address
         }
@@ -82,13 +87,13 @@ export async function generateQR(url: string): Promise<string | null> {
 // ---------------------------------------------------------------------------
 
 /**
- * Print the startup banner with URLs, Tailscale status, and QR code.
+ * Print the startup banner with URLs, mesh overlay status, and QR code.
  *
  * ```
  * remote-cc v0.1.0
  *
  *    Local:      http://localhost:7860?token=...
- *    Tailscale:  http://100.64.1.5:7860?token=...
+ *    Mesh:       http://100.96.0.4:7860?token=...  (Cloudflare WARP / Tailscale)
  *    LAN:        http://192.168.1.5:7860?token=...
  *
  *    [QR code]
@@ -100,7 +105,7 @@ export async function printStartupBanner(
   url: string,
   port: number,
   token?: string,
-  tailscale?: TailscaleStatus,
+  mesh?: MeshStatus,
   clusterToken?: string,
 ): Promise<void> {
   const addrs = detectNetworkAddresses()
@@ -109,16 +114,17 @@ export async function printStartupBanner(
   if (clusterToken) params.set('cluster_token', clusterToken)
   const qs = params.toString() ? `?${params.toString()}` : ''
 
-  // Prefer Tailscale CLI IP over network-interface detection
-  const tailscaleIp = tailscale?.ip ?? addrs.tailscale
+  // Prefer mesh CLI-reported IP over interface scan.
+  const meshIp = mesh?.ip ?? addrs.mesh
+  const meshLabel = mesh?.kind === 'tailscale' ? 'Tailscale' : 'Mesh'
 
   console.log()
   console.log(chalk.bold.cyan(`  remote-cc`) + chalk.dim(` v${VERSION}`))
   console.log()
   console.log(`   ${chalk.dim('Local:')}      ${chalk.green(`http://localhost:${port}${qs}`)}`)
-  if (tailscaleIp) {
+  if (meshIp) {
     console.log(
-      `   ${chalk.dim('Tailscale:')}  ${chalk.green(`http://${tailscaleIp}:${port}${qs}`)}`,
+      `   ${chalk.dim(`${meshLabel}:`.padEnd(11))}${chalk.green(`http://${meshIp}:${port}${qs}`)}`,
     )
   }
   if (addrs.lan) {
@@ -127,16 +133,18 @@ export async function printStartupBanner(
     )
   }
 
-  // Tailscale guidance messages
-  if (tailscale && !tailscale.installed) {
+  // Mesh guidance messages — shaped to whichever client we detected.
+  if (mesh && !mesh.installed) {
     console.log()
     console.log(
-      `   ${chalk.yellow('Tailscale not found.')} Install: ${chalk.underline('https://tailscale.com/download')}`,
+      `   ${chalk.yellow('Cloudflare WARP not found.')} Install: ${chalk.underline('https://1.1.1.1/')} (or Tailscale as a fallback)`,
     )
-  } else if (tailscale && tailscale.installed && !tailscale.loggedIn) {
+  } else if (mesh && mesh.installed && !mesh.loggedIn) {
     console.log()
+    const hint = mesh.kind === 'tailscale' ? 'tailscale up' : 'warp-cli connect'
+    const name = mesh.kind === 'tailscale' ? 'Tailscale' : 'Cloudflare WARP'
     console.log(
-      `   ${chalk.yellow('Tailscale installed but not connected.')} Run: ${chalk.cyan('tailscale up')}`,
+      `   ${chalk.yellow(`${name} installed but not connected.`)} Run: ${chalk.cyan(hint)}`,
     )
   }
 
@@ -145,13 +153,13 @@ export async function printStartupBanner(
     console.log(`   ${chalk.dim('Token:')}      ${chalk.yellow(token)}`)
   }
 
-  // QR codes — show one per available network (LAN + Tailscale)
+  // QR codes — show one per available network (LAN + Mesh)
   const qrUrls: { label: string; url: string }[] = []
   if (addrs.lan) {
     qrUrls.push({ label: 'LAN', url: `http://${addrs.lan}:${port}${qs}` })
   }
-  if (tailscaleIp) {
-    qrUrls.push({ label: 'Tailscale', url: `http://${tailscaleIp}:${port}${qs}` })
+  if (meshIp) {
+    qrUrls.push({ label: meshLabel, url: `http://${meshIp}:${port}${qs}` })
   }
   if (qrUrls.length === 0) {
     qrUrls.push({ label: 'Local', url: `http://localhost:${port}${qs}` })

@@ -226,7 +226,7 @@ Web PWA:
 ```
 在线:    🟢 Connected
 重连中:  🟡 Reconnecting... (attempt 2/5)
-离线:    🔴 Disconnected — check Tailscale
+离线:    🔴 Disconnected — check mesh (Cloudflare WARP / Tailscale)
 ```
 
 固定在页面顶部或底部状态栏。

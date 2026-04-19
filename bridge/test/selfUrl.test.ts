@@ -9,14 +9,16 @@ const base = {
   fallbackHostname: 'my-mac.local',
 }
 
+type MeshArg = Parameters<typeof pickSelfUrl>[0]['mesh']
+
 describe('pickSelfUrl', () => {
   it('CLI override wins over every auto-detection', () => {
     const r = pickSelfUrl({
       ...base,
       cliOverride: 'http://custom.example.com:9999',
       envOverride: 'http://env.example.com:8888',
-      addrs: { tailscale: '100.64.1.5', lan: '192.168.1.5' },
-      tailscale: { installed: true, loggedIn: true, ip: '100.64.1.5' } as unknown as Parameters<typeof pickSelfUrl>[0]['tailscale'],
+      addrs: { mesh: '100.64.1.5', lan: '192.168.1.5' },
+      mesh: { kind: 'warp', installed: true, loggedIn: true, ip: '100.64.1.5' } as unknown as MeshArg,
     })
     expect(r.url).toBe('http://custom.example.com:9999')
     expect(r.source).toBe('cli')
@@ -26,54 +28,54 @@ describe('pickSelfUrl', () => {
     const r = pickSelfUrl({
       ...base,
       envOverride: 'http://env.example.com:8888',
-      addrs: { tailscale: '100.64.1.5', lan: '192.168.1.5' },
+      addrs: { mesh: '100.64.1.5', lan: '192.168.1.5' },
     })
     expect(r.url).toBe('http://env.example.com:8888')
     expect(r.source).toBe('env')
   })
 
-  it('tailscale IP beats LAN when both are present', () => {
+  it('mesh IP beats LAN when both are present', () => {
     const r = pickSelfUrl({
       ...base,
-      addrs: { tailscale: '100.64.1.5', lan: '192.168.1.5' },
+      addrs: { mesh: '100.64.1.5', lan: '192.168.1.5' },
     })
     expect(r.url).toBe('http://100.64.1.5:7860')
-    expect(r.source).toBe('tailscale')
+    expect(r.source).toBe('mesh')
   })
 
-  it('tailscale CLI-reported IP wins over interface-scanned', () => {
+  it('mesh CLI-reported IP wins over interface-scanned', () => {
     const r = pickSelfUrl({
       ...base,
-      addrs: { tailscale: '100.64.1.5', lan: '192.168.1.5' },
-      tailscale: { installed: true, loggedIn: true, ip: '100.96.0.4' } as unknown as Parameters<typeof pickSelfUrl>[0]['tailscale'],
+      addrs: { mesh: '100.64.1.5', lan: '192.168.1.5' },
+      mesh: { kind: 'warp', installed: true, loggedIn: true, ip: '100.96.0.4' } as unknown as MeshArg,
     })
     expect(r.url).toBe('http://100.96.0.4:7860')
   })
 
-  it('skips stale Tailscale interface IP when Tailscale CLI says not logged in', () => {
-    // Scenario: tailscale0 iface still has a 100.x address from a previous
-    // login, but `tailscale status` reports loggedIn=false. The interface
-    // IP won't route — we must fall through to LAN.
+  it('skips stale mesh interface IP when mesh CLI reports not connected', () => {
+    // Scenario: utun interface still has a 100.x address from a previous
+    // session, but `warp-cli status` (or `tailscale status`) reports
+    // loggedIn=false. The interface IP won't route — fall through to LAN.
     const r = pickSelfUrl({
       ...base,
-      addrs: { tailscale: '100.64.1.5', lan: '192.168.1.5' },
-      tailscale: { installed: true, loggedIn: false, ip: null } as unknown as Parameters<typeof pickSelfUrl>[0]['tailscale'],
+      addrs: { mesh: '100.64.1.5', lan: '192.168.1.5' },
+      mesh: { kind: 'warp', installed: true, loggedIn: false, ip: null } as unknown as MeshArg,
     })
     expect(r.url).toBe('http://192.168.1.5:7860')
     expect(r.source).toBe('lan')
   })
 
-  it('LAN IP used when no tailscale', () => {
+  it('LAN IP used when no mesh', () => {
     const r = pickSelfUrl({
       ...base,
-      addrs: { tailscale: null, lan: '192.168.1.5' },
+      addrs: { mesh: null, lan: '192.168.1.5' },
     })
     expect(r.url).toBe('http://192.168.1.5:7860')
     expect(r.source).toBe('lan')
   })
 
   it('hostname fallback when no IPs at all', () => {
-    const r = pickSelfUrl({ ...base, addrs: { tailscale: null, lan: null } })
+    const r = pickSelfUrl({ ...base, addrs: { mesh: null, lan: null } })
     expect(r.url).toBe('http://my-mac.local:7860')
     expect(r.source).toBe('hostname')
   })
@@ -82,7 +84,7 @@ describe('pickSelfUrl', () => {
     const r = pickSelfUrl({
       ...base,
       cliOverride: 'not-a-url',
-      addrs: { tailscale: null, lan: '192.168.1.5' },
+      addrs: { mesh: null, lan: '192.168.1.5' },
     })
     expect(r.source).toBe('lan')
   })
@@ -91,7 +93,7 @@ describe('pickSelfUrl', () => {
     const r = pickSelfUrl({
       ...base,
       cliOverride: 'ftp://host/path',
-      addrs: { tailscale: null, lan: '10.0.0.5' },
+      addrs: { mesh: null, lan: '10.0.0.5' },
     })
     expect(r.source).toBe('lan')
   })
@@ -100,7 +102,7 @@ describe('pickSelfUrl', () => {
     const r = pickSelfUrl({
       ...base,
       cliOverride: 'http://host:7860/',
-      addrs: { tailscale: null, lan: null },
+      addrs: { mesh: null, lan: null },
     })
     expect(r.url).toBe('http://host:7860')
   })

@@ -28,7 +28,7 @@ import { waitForInitialize, InitializeTimeoutError } from './initializer.js'
 import { printStartupBanner } from './terminalUI.js'
 import { generateToken } from './auth.js'
 import { createMessageCache } from './messageCache.js'
-import { detectTailscale } from './tailscale.js'
+import { detectMesh } from './mesh.js'
 import { checkClaudeVersion } from './versionCheck.js'
 import { createProcessManager } from './processManager.js'
 import { scanSessions } from './sessionScanner.js'
@@ -83,7 +83,7 @@ Options:
   --continue, -c          Resume the most recent session
   --resume <session-id>   Resume a specific session by ID
   --relay, -r <url>       Connect to a relay server (V2, not yet implemented)
-  --local                 Direct connect mode via Tailscale (default)
+  --local                 Direct connect mode via mesh overlay (Cloudflare WARP / Tailscale) (default)
   --help, -h              Show this help
   --version, -v           Show version
 
@@ -93,7 +93,7 @@ Cluster Options:
   --server-token <token>  Cluster token (required for --role client)
   --machine-name <name>   Display name (default: hostname)
   --cluster-token <token> Cluster token for server mode (auto-generated if omitted)
-  --self-url <url>        URL to advertise to the cluster (default: auto-detect Tailscale → LAN → hostname)
+  --self-url <url>        URL to advertise to the cluster (default: auto-detect mesh IP → LAN → hostname)
                           Use this when running behind a reverse proxy, NAT, or custom DNS.
   `)
   process.exit(0)
@@ -176,16 +176,16 @@ async function main() {
   let currentMessageHandler: ((msg: Record<string, unknown>) => boolean) | null = null
 
   // -----------------------------------------------------------------------
-  // 3a. Detect Tailscale + LAN address BEFORE any cluster setup so the
-  // registered URL is reachable from other cluster peers (not just a bare
-  // hostname that may not resolve across the network).
+  // 3a. Detect mesh (Cloudflare WARP / Tailscale) + LAN address BEFORE any
+  // cluster setup so the registered URL is reachable from other cluster
+  // peers (not just a bare hostname that may not resolve across the network).
   // -----------------------------------------------------------------------
-  const tailscale = await detectTailscale()
+  const mesh = await detectMesh()
   const netAddrs = detectNetworkAddresses()
   const pickedSelf = pickSelfUrl({
     port,
     addrs: netAddrs,
-    tailscale,
+    mesh,
     cliOverride: args['self-url'],
     envOverride: process.env.REMOTE_CC_SELF_URL,
     fallbackHostname: osHostname(),
@@ -273,9 +273,9 @@ async function main() {
   })
 
   // -----------------------------------------------------------------------
-  // 5. Print terminal UI banner (Tailscale was already detected above)
+  // 5. Print terminal UI banner (mesh was already detected above)
   // -----------------------------------------------------------------------
-  await printStartupBanner(url, port, token, tailscale, cluster.role === 'server' ? cluster.clusterToken : undefined)
+  await printStartupBanner(url, port, token, mesh, cluster.role === 'server' ? cluster.clusterToken : undefined)
 
   // -----------------------------------------------------------------------
   // 5b. If running as cluster client, register + start heartbeats

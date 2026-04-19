@@ -8,24 +8,25 @@
  *
  * Resolution priority (first one that yields a value wins):
  *   1. --self-url CLI flag / REMOTE_CC_SELF_URL env  (operator override)
- *   2. Tailscale IP (reachable from any peer on the tailnet)
+ *   2. Mesh overlay IP (Cloudflare WARP / Tailscale — reachable from any
+ *      peer on the mesh)
  *   3. Detected LAN IP
- *   4. os.hostname() + port  (fallback; may still work on mDNS/MagicDNS)
+ *   4. os.hostname() + port  (fallback; may still work on mDNS)
  *
- * The caller passes in the already-detected NetworkAddresses + Tailscale
+ * The caller passes in the already-detected NetworkAddresses + mesh
  * status + port so this module stays pure / testable.
  */
 
 import type { NetworkAddresses } from './terminalUI.js'
-import type { TailscaleStatus } from './tailscale.js'
+import type { MeshStatus } from './mesh.js'
 
 export interface PickSelfUrlOpts {
   /** Port the bridge is listening on. */
   port: number
   /** From detectNetworkAddresses(). */
   addrs: NetworkAddresses
-  /** From detectTailscale() — may be undefined if detection was skipped. */
-  tailscale?: TailscaleStatus
+  /** From detectMesh() — may be undefined if detection was skipped. */
+  mesh?: MeshStatus
   /** CLI override: --self-url http://host:port (no path). */
   cliOverride?: string
   /** Env override: REMOTE_CC_SELF_URL. Applied only if cliOverride absent. */
@@ -37,7 +38,7 @@ export interface PickSelfUrlOpts {
 export interface PickSelfUrlResult {
   url: string
   /** Which source supplied the URL — useful for startup logging. */
-  source: 'cli' | 'env' | 'tailscale' | 'lan' | 'hostname'
+  source: 'cli' | 'env' | 'mesh' | 'lan' | 'hostname'
 }
 
 /** Normalize http(s) URL input: strip trailing slash, verify scheme. */
@@ -66,17 +67,18 @@ export function pickSelfUrl(opts: PickSelfUrlOpts): PickSelfUrlResult {
     if (norm) return { url: norm, source: 'env' }
   }
 
-  // 3. Tailscale — prefer the CLI-reported IP, fall back to interface scan.
-  // BUT: if the Tailscale CLI explicitly reports the daemon is NOT logged
-  // in, an interface-scanned 100.x address is a stale leftover and won't
-  // route. Skip the Tailscale branch entirely in that case.
-  const tsInstalledButOffline =
-    opts.tailscale?.installed === true && opts.tailscale.loggedIn === false
-  const tailscaleIp = tsInstalledButOffline
+  // 3. Mesh overlay (Cloudflare WARP / Tailscale) — prefer the CLI-reported
+  // IP, fall back to interface scan. BUT: if the mesh CLI explicitly
+  // reports the daemon is NOT connected, an interface-scanned 100.x
+  // address is a stale leftover and won't route. Skip the mesh branch
+  // entirely in that case.
+  const meshInstalledButOffline =
+    opts.mesh?.installed === true && opts.mesh.loggedIn === false
+  const meshIp = meshInstalledButOffline
     ? null
-    : opts.tailscale?.ip ?? opts.addrs.tailscale
-  if (tailscaleIp) {
-    return { url: `http://${tailscaleIp}:${opts.port}`, source: 'tailscale' }
+    : opts.mesh?.ip ?? opts.addrs.mesh
+  if (meshIp) {
+    return { url: `http://${meshIp}:${opts.port}`, source: 'mesh' }
   }
 
   // 4. LAN

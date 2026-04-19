@@ -27,7 +27,7 @@ Claude Code 的 Remote Control 功能（从手机远程操控本机 CLI）只对
 - bridge 本地进程：spawn claude + WebSocket server + QR code
 - Web PWA：对话 UI + 流式输出 + 权限审批 + 工具调用渲染
 - 文件 viewer（syntax highlight）
-- Tailscale 自动检测 + IP 输出
+- Mesh overlay 自动检测 + IP 输出（Cloudflare WARP 默认 / Tailscale 兼容）
 - token 认证
 - 断线重连
 
@@ -50,7 +50,7 @@ Claude Code 的 Remote Control 功能（从手机远程操控本机 CLI）只对
 
 - 不改原版 Claude Code，通过 `claude -p --input-format stream-json --output-format stream-json` 桥接
 - 消息协议 100% 对齐 Claude Code SDK stream-json 格式
-- V1 穿透依赖 Tailscale（用户自装）
+- V1 穿透依赖 mesh overlay（Cloudflare WARP 默认，Tailscale 兼容，用户自装）
 - bridge 用 Node.js/TypeScript（npm 分发）
 - web 用 React + Vite（PWA，内嵌在 bridge 进程里）
 - V2 relay 用 Go
@@ -59,7 +59,7 @@ Claude Code 的 Remote Control 功能（从手机远程操控本机 CLI）只对
 
 | 功能 | 验收标准 |
 |------|---------|
-| bridge 启动 | `remote-cc` → 终端显示 QR code + Tailscale IP + URL，3 秒内就绪 |
+| bridge 启动 | `remote-cc` → 终端显示 QR code + mesh IP + URL，3 秒内就绪 |
 | 手机连接 | 扫 QR code → PWA 打开 → 显示 "Connected"，5 秒内 |
 | 发送 prompt | 手机输入 "hi" → 本机 claude 执行 → 手机看到回复，延迟 < 1 秒（不算 AI 生成时间）|
 | 流式输出 | AI 回复逐 token 出现在手机上，和本地 CLI 同步 |
@@ -67,7 +67,7 @@ Claude Code 的 Remote Control 功能（从手机远程操控本机 CLI）只对
 | 文件 viewer | claude 读取文件 → 手机显示文件内容 + 语法高亮 |
 | Markdown | AI 回复包含代码块 → 手机正确渲染 + syntax highlight |
 | 断线重连 | 手机 WiFi 断一下 → 自动重连 → 不丢当前消息 |
-| Tailscale 检测 | Tailscale 已连接 → 显示 `http://100.x.x.x:7860`；未连接 → 提示 `tailscale up` |
+| Mesh 检测 | mesh client 已连接 → 显示 `http://100.x.x.x:7860`；未连接 → 提示 `warp-cli connect` 或 `tailscale up` |
 | 安全 | 无 token 的 WebSocket 连接被拒绝（4003 close） |
 
 ## 六、风险评估
@@ -75,6 +75,6 @@ Claude Code 的 Remote Control 功能（从手机远程操控本机 CLI）只对
 | 风险 | 概率 | 影响 | 缓解 |
 |------|------|------|------|
 | Claude Code stream-json 格式变更 | Low | High | 容错设计：不识别的 type 透传不拦截 |
-| Tailscale 不支持某些网络环境 | Med | Med | V2 加 relay 和 Cloudflare Tunnel 备选 |
+| Mesh overlay 不支持某些网络环境 | Med | Med | V2 加 relay 备选；手机已内置 Cloudflare WARP 的场景下直连更稳 |
 | 手机浏览器 WebSocket 限制（iOS Safari 后台断连）| Med | Med | 自动重连 + PWA 保活 |
 | stream-json 大量 partial messages 导致手机卡顿 | Low | Med | requestAnimationFrame 节流 + 虚拟滚动 |
